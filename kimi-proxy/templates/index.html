@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Kimi Proxy</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Kimi Proxy</h1>
+            <p class="subtitle">Access Kimi AI through this proxy</p>
+        </header>
+
+        <div class="status-bar">
+            <span id="status-indicator" class="status logged-out">
+                Checking...
+            </span>
+            <span id="browser-status"></span>
+        </div>
+
+        <div class="login-section" id="login-section">
+            <h2>Login to Kimi</h2>
+            <div class="login-steps">
+                <div class="step">
+                    <span class="step-number">1</span>
+                    <div class="step-content">
+                        <h3>Open Kimi</h3>
+                        <p>Click the button below to open Kimi in a browser window</p>
+                        <button id="btn-open-kimi" class="btn btn-primary">Open Kimi Login</button>
+                    </div>
+                </div>
+
+                <div class="step">
+                    <span class="step-number">2</span>
+                    <div class="step-content">
+                        <h3>Login Manually</h3>
+                        <p>Login to your Kimi account in the browser window</p>
+                    </div>
+                </div>
+
+                <div class="step">
+                    <span class="step-number">3</span>
+                    <div class="step-content">
+                        <h3>Confirm Login</h3>
+                        <p>After logging in, click the button below to save your session</p>
+                        <button id="btn-confirm-login" class="btn btn-success" disabled>I've logged in</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="chat-section" id="chat-section" style="display: none;">
+            <h2>Chat with Kimi</h2>
+            <div class="chat-container">
+                <div id="chat-messages" class="chat-messages">
+                    <div class="message system">
+                        Welcome to Kimi Proxy! Type your message below.
+                    </div>
+                </div>
+                <div class="chat-input">
+                    <textarea id="message-input" placeholder="Type your message..." rows="3"></textarea>
+                    <button id="btn-send" class="btn btn-primary">Send</button>
+                </div>
+            </div>
+            <div class="chat-actions">
+                <button id="btn-close-browser" class="btn btn-secondary">Close Browser</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            const statusIndicator = document.getElementById('status-indicator');
+            const browserStatus = document.getElementById('browser-status');
+            const loginSection = document.getElementById('login-section');
+            const chatSection = document.getElementById('chat-section');
+            const chatMessages = document.getElementById('chat-messages');
+            const messageInput = document.getElementById('message-input');
+            const btnSend = document.getElementById('btn-send');
+            const btnOpenKimi = document.getElementById('btn-open-kimi');
+            const btnConfirmLogin = document.getElementById('btn-confirm-login');
+            const btnCloseBrowser = document.getElementById('btn-close-browser');
+
+            // Check status on load
+            checkStatus();
+
+            // Open Kimi
+            btnOpenKimi.addEventListener('click', async function() {
+                btnOpenKimi.disabled = true;
+                btnOpenKimi.textContent = 'Opening Kimi...';
+
+                try {
+                    const response = await fetch('/api/login', { method: 'POST' });
+                    const data = await response.json();
+
+                    if (data.success) {
+                        btnConfirmLogin.disabled = false;
+                        statusIndicator.textContent = 'Browser Opened - Please Login';
+                        statusIndicator.className = 'status waiting';
+                    } else {
+                        alert('Error: ' + (data.error || 'Unknown error'));
+                    }
+                } catch (error) {
+                    alert('Error: ' + error.message);
+                }
+
+                btnOpenKimi.disabled = false;
+                btnOpenKimi.textContent = 'Open Kimi Login';
+            });
+
+            // Confirm login
+            btnConfirmLogin.addEventListener('click', async function() {
+                btnConfirmLogin.disabled = true;
+                btnConfirmLogin.textContent = 'Saving...';
+
+                try {
+                    const response = await fetch('/api/login/confirm', { method: 'POST' });
+                    const data = await response.json();
+
+                    if (data.success) {
+                        if (data.logged_in) {
+                            statusIndicator.textContent = '✓ Logged In';
+                            statusIndicator.className = 'status logged-in';
+                            loginSection.style.display = 'none';
+                            chatSection.style.display = 'block';
+                        } else {
+                            alert('Login not detected. Please make sure you are logged in to Kimi.');
+                            btnConfirmLogin.disabled = false;
+                            btnConfirmLogin.textContent = "I've logged in";
+                        }
+                    } else {
+                        alert('Error: ' + (data.error || 'Unknown error'));
+                        btnConfirmLogin.disabled = false;
+                        btnConfirmLogin.textContent = "I've logged in";
+                    }
+                } catch (error) {
+                    alert('Error: ' + error.message);
+                    btnConfirmLogin.disabled = false;
+                    btnConfirmLogin.textContent = "I've logged in";
+                }
+            });
+
+            // Send message
+            btnSend.addEventListener('click', sendMessage);
+            messageInput.addEventListener('keydown', function(e) {
+                if (e.key === 'Enter' && !e.shiftKey) {
+                    e.preventDefault();
+                    sendMessage();
+                }
+            });
+
+            async function sendMessage() {
+                const message = messageInput.value.trim();
+                if (!message) return;
+
+                addMessage(message, 'user');
+                messageInput.value = '';
+                btnSend.disabled = true;
+                btnSend.textContent = 'Sending...';
+
+                try {
+                    const response = await fetch('/api/chat', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ message })
+                    });
+                    const data = await response.json();
+
+                    if (data.success) {
+                        addMessage(data.response, 'assistant');
+                    } else {
+                        addMessage('Error: ' + (data.error || 'Unknown error'), 'error');
+                    }
+                } catch (error) {
+                    addMessage('Error: ' + error.message, 'error');
+                }
+
+                btnSend.disabled = false;
+                btnSend.textContent = 'Send';
+            }
+
+            // Close browser
+            btnCloseBrowser.addEventListener('click', async function() {
+                try {
+                    await fetch('/api/close', { method: 'POST' });
+                    chatSection.style.display = 'none';
+                    loginSection.style.display = 'block';
+                    statusIndicator.textContent = '✗ Not Logged In';
+                    statusIndicator.className = 'status logged-out';
+                    btnConfirmLogin.disabled = true;
+                } catch (error) {
+                    alert('Error: ' + error.message);
+                }
+            });
+
+            function addMessage(content, type) {
+                const messageDiv = document.createElement('div');
+                messageDiv.className = 'message ' + type;
+                messageDiv.textContent = content;
+                chatMessages.appendChild(messageDiv);
+                chatMessages.scrollTop = chatMessages.scrollHeight;
+            }
+
+            async function checkStatus() {
+                try {
+                    const response = await fetch('/api/status');
+                    const data = await response.json();
+
+                    if (data.browser_ready) {
+                        statusIndicator.textContent = '✓ Browser Ready';
+                        statusIndicator.className = 'status logged-in';
+                        loginSection.style.display = 'none';
+                        chatSection.style.display = 'block';
+                    } else {
+                        statusIndicator.textContent = '✗ Not Logged In';
+                        statusIndicator.className = 'status logged-out';
+                        loginSection.style.display = 'block';
+                        chatSection.style.display = 'none';
+                    }
+                } catch (error) {
+                    console.error('Error checking status:', error);
+                }
+            }
+        });
+    </script>
+</body>
+</html>

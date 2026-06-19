@@ -1,0 +1,33 @@
+# Auth/Cookie files
+kimi_cookies.json
+kimi_auth.json
+kimi_storage.json
+*_cookies.json
+*_auth.json
+*_storage.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
