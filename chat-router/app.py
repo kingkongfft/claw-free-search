@@ -62,6 +62,13 @@ PROVIDERS: dict[str, dict] = {
         "color": "#00b96b",
         "icon": "B",
     },
+    "google": {
+        "name": "Google AI",
+        "url": "https://www.google.com/search?udm=50&aep=11",
+        "storage": Path("google_storage.json"),
+        "color": "#ea4335",
+        "icon": "G",
+    },
 }
 
 # Provider-specific DOM selectors.
@@ -153,6 +160,47 @@ PROVIDER_CONFIGS: dict[str, dict] = {
             const text = document.body.innerText || '';
             return text.includes('\u65b0\u5efa\u5bf9\u8bdd') || text.includes('New Chat')
                 || document.querySelectorAll('[class*="avatar"]').length > 0;
+        }""",
+    },
+    "google": {
+        # Google AI Mode (udm=50). The search box is the input; the AI answer
+        # renders into a results container after submitting.
+        "input_selectors": [
+            'textarea[name="q"]',
+            'textarea[aria-label*="Search"]',
+            'div[contenteditable="true"][role="combobox"]',
+            'div[contenteditable="true"]',
+            "textarea",
+        ],
+        "segment_selectors": [
+            '[data-rl][role="presentation"]',
+            'div[data-async-context] [class*="markdown"]',
+            "[jsname][data-mid]",
+            '[class*="markdown"]',
+            "[data-attrid]",
+        ],
+        "generating_sel": (
+            '[role="progressbar"], [class*="loading"], '
+            '[aria-busy="true"], [class*="thinking"]'
+        ),
+        "noise_patterns": [
+            "/^Search$/",
+            "/^Images$/",
+            "/^Videos$/",
+            "/^News$/",
+            "/^Maps$/",
+            "/^Shopping$/",
+            "/^All$/",
+            "/^Sign in$/",
+            "/^AI Mode/",
+            "/^About \\d+ results/",
+        ],
+        # Google search works without sign-in; AI Mode availability can depend on
+        # account/region. We just confirm the search UI loaded.
+        "login_check_js": """() => {
+            return document.querySelector('textarea[name="q"]') !== null
+                || document.querySelector('div[contenteditable="true"][role="combobox"]') !== null
+                || (document.body.innerText || '').length > 0;
         }""",
     },
 }

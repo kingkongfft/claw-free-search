@@ -31,3 +31,7 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Test / tooling artifacts
+.playwright-mcp/
+_tmp_test.py

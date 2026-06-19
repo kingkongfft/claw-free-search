@@ -1,5 +1,5 @@
 """
-Automated tests for kimi-proxy Flask app.
+Automated tests for chat-router Flask app.
 
 Tests the UI rendering and all REST API endpoints without requiring a real
 Kimi login (the chat and confirm endpoints are tested for correct error

@@ -5,6 +5,11 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>AI Chat Router</title>
     <link rel="stylesheet" href="/static/style.css">
+    <!-- Markdown rendering + syntax highlighting + sanitization -->
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/github-dark.min.css">
+    <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.5/dist/purify.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
 </head>
 <body>
     <div class="app">
@@ -351,9 +356,15 @@
             badge.style.background = p.color;
             badge.textContent = p.name;
 
-            const pre = document.createElement('pre');
-            pre.className = 'msg-text';
-            pre.textContent = text;
+            const body = document.createElement('div');
+            body.className = 'msg-md';
+            body.innerHTML = renderMarkdown(text);
+            // Syntax-highlight any code blocks.
+            if (window.hljs) {
+                body.querySelectorAll('pre code').forEach((el) => {
+                    try { window.hljs.highlightElement(el); } catch (e) {}
+                });
+            }
 
             const copyBtn = document.createElement('button');
             copyBtn.className = 'copy-btn';
@@ -366,10 +377,26 @@
             });
 
             wrap.appendChild(badge);
-            wrap.appendChild(pre);
+            wrap.appendChild(body);
             wrap.appendChild(copyBtn);
             chatMessages.appendChild(wrap);
             chatMessages.scrollTop = chatMessages.scrollHeight;
+        }
+
+        // Render markdown to sanitized HTML. Falls back to escaped plain text
+        // (with newlines preserved) if the markdown libraries failed to load.
+        function renderMarkdown(text) {
+            text = text || '';
+            if (window.marked && window.DOMPurify) {
+                try {
+                    marked.setOptions({ breaks: true, gfm: true });
+                    const html = marked.parse(text);
+                    return DOMPurify.sanitize(html);
+                } catch (e) { /* fall through */ }
+            }
+            const esc = text
+                .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+            return '<p>' + esc.replace(/\n/g, '<br>') + '</p>';
         }
 
         function addSystemMsg(text) {

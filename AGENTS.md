@@ -9,7 +9,7 @@ API key, by driving a real Chromium browser via Playwright and replaying a manua
 
 1. **Root CLI scripts** (`kimi_search.py`, `kimi_auth.py`) — open a visible browser for
    manual Kimi login, save cookies, reuse them for queries.
-2. **`kimi-proxy/`** — a Flask app (`app.py`) that exposes a multi-provider chat router
+2. **`chat-router/`** — a Flask app (`app.py`) that exposes a multi-provider chat router
    over REST. Requests are load-balanced **round-robin** across all providers that have a
    saved session file. Single-page vanilla-JS UI in `templates/index.html`.
 
@@ -24,7 +24,7 @@ claw-free-search/
 ├── kimi_auth.py            # Interactive CLI: KimiAuth + KimiSearch classes
 ├── kimi_search.py          # Simple CLI: login + search
 ├── requirements.txt        # Root deps: playwright, requests
-├── kimi-proxy/
+├── chat-router/
 │   ├── app.py              # Flask router; async Playwright in a dedicated thread
 │   ├── test_app.py         # Standalone smoke test (runs against a live server)
 │   ├── requirements.txt    # flask, playwright, requests
@@ -36,7 +36,7 @@ claw-free-search/
 
 ```bash
 pip install -r requirements.txt              # root scripts
-pip install -r kimi-proxy/requirements.txt   # proxy
+pip install -r chat-router/requirements.txt   # proxy
 playwright install chromium
 ```
 
@@ -49,7 +49,7 @@ python kimi_search.py --login                # first-time Kimi login (visible br
 python kimi_search.py "what is quantum computing"
 python kimi_auth.py                          # interactive menu
 
-python kimi-proxy/app.py                     # start proxy on http://localhost:5000
+python chat-router/app.py                     # start proxy on http://localhost:5000
 ```
 
 ## Lint / Format
@@ -67,12 +67,12 @@ defaults (88 cols). Keep lines readable (≤ 100 chars).
 
 ## Testing
 
-`kimi-proxy/test_app.py` is a **standalone script**, NOT pytest. It drives the live UI/API
+`chat-router/test_app.py` is a **standalone script**, NOT pytest. It drives the live UI/API
 with sync Playwright and exits non-zero on failure. The server must be running first.
 
 ```bash
-python kimi-proxy/app.py &                   # start server on :5000
-python kimi-proxy/test_app.py                # run all smoke tests
+python chat-router/app.py &                   # start server on :5000
+python chat-router/test_app.py                # run all smoke tests
 ```
 
 There is no single-test selector; it is one script. To run one check, comment out others
@@ -86,7 +86,7 @@ in `run_tests()`. When adding real unit tests:
 
 ## CRITICAL: Playwright Threading
 
-`kimi-proxy/app.py` uses **async Playwright in one dedicated background thread** that owns
+`chat-router/app.py` uses **async Playwright in one dedicated background thread** that owns
 an asyncio event loop. Flask handler threads talk to it via a `queue.Queue` of command
 dicts; results return through per-command result slots. **Never** call `sync_playwright`
 from a Flask request thread or spawn `threading.Thread` running the sync API — it raises
@@ -155,5 +155,5 @@ comments for non-obvious selectors and Playwright workarounds.
 
 ## Provider Registry
 New backends are added to the `PROVIDERS` dict and `PROVIDER_CONFIGS` (selectors, login
-check JS) in `kimi-proxy/app.py`. A provider joins the round-robin only once its
-`<provider>_storage.json` exists. See `kimi-proxy/ROUTER_PLAN.md` for design details.
+check JS) in `chat-router/app.py`. A provider joins the round-robin only once its
+`<provider>_storage.json` exists. See `chat-router/ROUTER_PLAN.md` for design details.
