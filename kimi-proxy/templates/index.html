@@ -3,227 +3,411 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Kimi Proxy</title>
+    <title>AI Chat Router</title>
     <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-    <div class="container">
-        <header>
-            <h1>Kimi Proxy</h1>
-            <p class="subtitle">Access Kimi AI through this proxy</p>
-        </header>
+    <div class="app">
+        <!-- ── Left sidebar ─────────────────────────────────────── -->
+        <aside class="sidebar">
+            <div class="sidebar-header">
+                <h1>AI Router</h1>
+                <p class="sidebar-sub">Round-robin chat proxy</p>
+            </div>
 
-        <div class="status-bar">
-            <span id="status-indicator" class="status logged-out">
-                Checking...
-            </span>
-            <span id="browser-status"></span>
-        </div>
+            <div class="provider-list" id="provider-list">
+                <!-- Populated by JS from /api/providers -->
+            </div>
 
-        <div class="login-section" id="login-section">
-            <h2>Login to Kimi</h2>
-            <div class="login-steps">
-                <div class="step">
-                    <span class="step-number">1</span>
-                    <div class="step-content">
-                        <h3>Open Kimi</h3>
-                        <p>Click the button below to open Kimi in a browser window</p>
-                        <button id="btn-open-kimi" class="btn btn-primary">Open Kimi Login</button>
+            <div class="sidebar-footer">
+                <div id="rr-status" class="rr-status">Checking...</div>
+            </div>
+        </aside>
+
+        <!-- ── Right chat panel ──────────────────────────────────── -->
+        <main class="chat-panel">
+            <div class="chat-messages" id="chat-messages">
+                <div class="msg msg--system">
+                    Welcome! Login to at least one provider on the left, then start chatting.
+                    Messages are forwarded round-robin across all logged-in providers.
+                </div>
+            </div>
+
+            <div class="chat-input-bar">
+                <textarea
+                    id="message-input"
+                    placeholder="Type your message… (Enter to send, Shift+Enter for newline)"
+                    rows="3"
+                ></textarea>
+                <button id="btn-send" class="btn btn-primary" disabled>Send</button>
+            </div>
+        </main>
+    </div>
+
+    <!-- ── Login modal ───────────────────────────────────────────── -->
+    <div class="modal-overlay" id="modal-overlay" style="display:none">
+        <div class="modal">
+            <h2 id="modal-title">Login</h2>
+            <div class="modal-steps">
+                <div class="modal-step">
+                    <span class="step-num">1</span>
+                    <div>
+                        <strong>Open browser</strong>
+                        <p id="modal-desc">A browser window will open. Login to your account.</p>
+                        <button id="modal-btn-open" class="btn btn-primary">Open Login Window</button>
                     </div>
                 </div>
-
-                <div class="step">
-                    <span class="step-number">2</span>
-                    <div class="step-content">
-                        <h3>Login Manually</h3>
-                        <p>Login to your Kimi account in the browser window</p>
+                <div class="modal-step">
+                    <span class="step-num">2</span>
+                    <div>
+                        <strong>Login manually</strong>
+                        <p>Complete the login in the browser window.</p>
                     </div>
                 </div>
-
-                <div class="step">
-                    <span class="step-number">3</span>
-                    <div class="step-content">
-                        <h3>Confirm Login</h3>
-                        <p>After logging in, click the button below to save your session</p>
-                        <button id="btn-confirm-login" class="btn btn-success" disabled>I've logged in</button>
+                <div class="modal-step">
+                    <span class="step-num">3</span>
+                    <div>
+                        <strong>Confirm</strong>
+                        <p>Click below once you are logged in.</p>
+                        <button id="modal-btn-confirm" class="btn btn-success" disabled>I've logged in</button>
                     </div>
                 </div>
             </div>
-        </div>
-
-        <div class="chat-section" id="chat-section" style="display: none;">
-            <h2>Chat with Kimi</h2>
-            <div class="chat-container">
-                <div id="chat-messages" class="chat-messages">
-                    <div class="message system">
-                        Welcome to Kimi Proxy! Type your message below.
-                    </div>
-                </div>
-                <div class="chat-input">
-                    <textarea id="message-input" placeholder="Type your message..." rows="3"></textarea>
-                    <button id="btn-send" class="btn btn-primary">Send</button>
-                </div>
-            </div>
-            <div class="chat-actions">
-                <button id="btn-close-browser" class="btn btn-secondary">Close Browser</button>
-            </div>
+            <button class="modal-close" id="modal-btn-close">Cancel</button>
         </div>
     </div>
 
     <script>
-        document.addEventListener('DOMContentLoaded', function() {
-            const statusIndicator = document.getElementById('status-indicator');
-            const browserStatus = document.getElementById('browser-status');
-            const loginSection = document.getElementById('login-section');
-            const chatSection = document.getElementById('chat-section');
-            const chatMessages = document.getElementById('chat-messages');
-            const messageInput = document.getElementById('message-input');
-            const btnSend = document.getElementById('btn-send');
-            const btnOpenKimi = document.getElementById('btn-open-kimi');
-            const btnConfirmLogin = document.getElementById('btn-confirm-login');
-            const btnCloseBrowser = document.getElementById('btn-close-browser');
+    (() => {
+        // ── State ───────────────────────────────────────────────────
+        let providers = {};          // keyed by provider id
+        let activeModal = null;      // provider id whose modal is open
+        let pollTimer = null;
 
-            // Check status on load
-            checkStatus();
+        // ── DOM refs ────────────────────────────────────────────────
+        const providerList  = document.getElementById('provider-list');
+        const chatMessages  = document.getElementById('chat-messages');
+        const messageInput  = document.getElementById('message-input');
+        const btnSend       = document.getElementById('btn-send');
+        const rrStatus      = document.getElementById('rr-status');
+        const modalOverlay  = document.getElementById('modal-overlay');
+        const modalTitle    = document.getElementById('modal-title');
+        const modalDesc     = document.getElementById('modal-desc');
+        const modalBtnOpen  = document.getElementById('modal-btn-open');
+        const modalBtnConfirm = document.getElementById('modal-btn-confirm');
+        const modalBtnClose = document.getElementById('modal-btn-close');
 
-            // Open Kimi
-            btnOpenKimi.addEventListener('click', async function() {
-                btnOpenKimi.disabled = true;
-                btnOpenKimi.textContent = 'Opening Kimi...';
+        // ── Provider polling ────────────────────────────────────────
+        async function fetchProviders() {
+            try {
+                const res = await fetch('/api/providers');
+                providers = await res.json();
+                renderProviders();
+                updateSendButton();
+            } catch (e) {
+                console.error('fetchProviders:', e);
+            }
+        }
 
-                try {
-                    const response = await fetch('/api/login', { method: 'POST' });
-                    const data = await response.json();
+        function startPolling() {
+            fetchProviders();
+            pollTimer = setInterval(fetchProviders, 5000);
+        }
 
-                    if (data.success) {
-                        btnConfirmLogin.disabled = false;
-                        statusIndicator.textContent = 'Browser Opened - Please Login';
-                        statusIndicator.className = 'status waiting';
-                    } else {
-                        alert('Error: ' + (data.error || 'Unknown error'));
-                    }
-                } catch (error) {
-                    alert('Error: ' + error.message);
-                }
+        // ── Render sidebar ──────────────────────────────────────────
+        function renderProviders() {
+            providerList.innerHTML = '';
+            const anyReady = Object.values(providers).some(p => p.ready);
 
-                btnOpenKimi.disabled = false;
-                btnOpenKimi.textContent = 'Open Kimi Login';
-            });
-
-            // Confirm login
-            btnConfirmLogin.addEventListener('click', async function() {
-                btnConfirmLogin.disabled = true;
-                btnConfirmLogin.textContent = 'Saving...';
-
-                try {
-                    const response = await fetch('/api/login/confirm', { method: 'POST' });
-                    const data = await response.json();
-
-                    if (data.success) {
-                        if (data.logged_in) {
-                            statusIndicator.textContent = '✓ Logged In';
-                            statusIndicator.className = 'status logged-in';
-                            loginSection.style.display = 'none';
-                            chatSection.style.display = 'block';
-                        } else {
-                            alert('Login not detected. Please make sure you are logged in to Kimi.');
-                            btnConfirmLogin.disabled = false;
-                            btnConfirmLogin.textContent = "I've logged in";
-                        }
-                    } else {
-                        alert('Error: ' + (data.error || 'Unknown error'));
-                        btnConfirmLogin.disabled = false;
-                        btnConfirmLogin.textContent = "I've logged in";
-                    }
-                } catch (error) {
-                    alert('Error: ' + error.message);
-                    btnConfirmLogin.disabled = false;
-                    btnConfirmLogin.textContent = "I've logged in";
-                }
-            });
-
-            // Send message
-            btnSend.addEventListener('click', sendMessage);
-            messageInput.addEventListener('keydown', function(e) {
-                if (e.key === 'Enter' && !e.shiftKey) {
-                    e.preventDefault();
-                    sendMessage();
-                }
-            });
-
-            async function sendMessage() {
-                const message = messageInput.value.trim();
-                if (!message) return;
-
-                addMessage(message, 'user');
-                messageInput.value = '';
-                btnSend.disabled = true;
-                btnSend.textContent = 'Sending...';
-
-                try {
-                    const response = await fetch('/api/chat', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ message })
-                    });
-                    const data = await response.json();
-
-                    if (data.success) {
-                        addMessage(data.response, 'assistant');
-                    } else {
-                        addMessage('Error: ' + (data.error || 'Unknown error'), 'error');
-                    }
-                } catch (error) {
-                    addMessage('Error: ' + error.message, 'error');
-                }
-
-                btnSend.disabled = false;
-                btnSend.textContent = 'Send';
+            // Round-robin status label
+            const readyNames = Object.entries(providers)
+                .filter(([, p]) => p.ready)
+                .map(([, p]) => p.name);
+            if (readyNames.length === 0) {
+                rrStatus.textContent = 'No providers ready';
+                rrStatus.className = 'rr-status rr-status--none';
+            } else {
+                rrStatus.textContent = 'Round-robin: ' + readyNames.join(' → ');
+                rrStatus.className = 'rr-status rr-status--active';
             }
 
-            // Close browser
-            btnCloseBrowser.addEventListener('click', async function() {
-                try {
-                    await fetch('/api/close', { method: 'POST' });
-                    chatSection.style.display = 'none';
-                    loginSection.style.display = 'block';
-                    statusIndicator.textContent = '✗ Not Logged In';
-                    statusIndicator.className = 'status logged-out';
-                    btnConfirmLogin.disabled = true;
-                } catch (error) {
-                    alert('Error: ' + error.message);
-                }
-            });
+            for (const [id, p] of Object.entries(providers)) {
+                const card = document.createElement('div');
+                card.className = 'provider-card' +
+                    (p.active     ? ' provider-card--active'     : '') +
+                    (p.login_open ? ' provider-card--login-open' : '') +
+                    (p.ready      ? ' provider-card--ready'      : '');
+                card.dataset.provider = id;
 
-            function addMessage(content, type) {
-                const messageDiv = document.createElement('div');
-                messageDiv.className = 'message ' + type;
-                messageDiv.textContent = content;
-                chatMessages.appendChild(messageDiv);
-                chatMessages.scrollTop = chatMessages.scrollHeight;
+                const dot = document.createElement('span');
+                dot.className = 'provider-dot' +
+                    (p.active     ? ' dot--active' :
+                     p.login_open ? ' dot--pending' :
+                     p.ready      ? ' dot--ready'   : ' dot--off');
+
+                const icon = document.createElement('span');
+                icon.className = 'provider-icon';
+                icon.style.background = p.color;
+                icon.textContent = p.icon;
+
+                const info = document.createElement('div');
+                info.className = 'provider-info';
+
+                const name = document.createElement('span');
+                name.className = 'provider-name';
+                name.textContent = p.name;
+
+                const statusLabel = document.createElement('span');
+                statusLabel.className = 'provider-status-label';
+                statusLabel.textContent =
+                    p.active     ? 'Responding...' :
+                    p.login_open ? 'Waiting for login...' :
+                    p.ready      ? 'Ready' : 'Not logged in';
+
+                info.appendChild(name);
+                info.appendChild(statusLabel);
+
+                const btn = document.createElement('button');
+                btn.className = 'btn btn-sm ' + (p.ready ? 'btn-outline' : 'btn-primary');
+                btn.textContent = p.login_open ? "Confirm login" :
+                                  p.ready      ? 'Re-login'      : 'Login';
+                btn.dataset.provider = id;
+
+                if (p.login_open) {
+                    btn.addEventListener('click', () => openConfirmModal(id));
+                } else {
+                    btn.addEventListener('click', () => openLoginModal(id));
+                }
+
+                card.appendChild(dot);
+                card.appendChild(icon);
+                card.appendChild(info);
+                card.appendChild(btn);
+                providerList.appendChild(card);
             }
+        }
 
-            async function checkStatus() {
-                try {
-                    const response = await fetch('/api/status');
-                    const data = await response.json();
+        function updateSendButton() {
+            const anyReady = Object.values(providers).some(p => p.ready);
+            btnSend.disabled = !anyReady;
+        }
 
-                    if (data.browser_ready) {
-                        statusIndicator.textContent = '✓ Browser Ready';
-                        statusIndicator.className = 'status logged-in';
-                        loginSection.style.display = 'none';
-                        chatSection.style.display = 'block';
-                    } else {
-                        statusIndicator.textContent = '✗ Not Logged In';
-                        statusIndicator.className = 'status logged-out';
-                        loginSection.style.display = 'block';
-                        chatSection.style.display = 'none';
-                    }
-                } catch (error) {
-                    console.error('Error checking status:', error);
+        // ── Highlight active provider card ──────────────────────────
+        function setActiveCard(providerId) {
+            document.querySelectorAll('.provider-card').forEach(c => {
+                c.classList.toggle('provider-card--active', c.dataset.provider === providerId);
+            });
+        }
+
+        function clearActiveCard() {
+            document.querySelectorAll('.provider-card').forEach(c => {
+                c.classList.remove('provider-card--active');
+            });
+        }
+
+        // ── Login modal ─────────────────────────────────────────────
+        function openLoginModal(providerId) {
+            activeModal = providerId;
+            const p = providers[providerId];
+            modalTitle.textContent = `Login to ${p.name}`;
+            modalDesc.textContent  = `A browser window will open for ${p.name}. Login to your account, then click "I've logged in".`;
+            modalBtnOpen.textContent = `Open ${p.name} Login`;
+            modalBtnConfirm.disabled = true;
+            modalBtnConfirm.textContent = "I've logged in";
+            modalOverlay.style.display = 'flex';
+        }
+
+        function openConfirmModal(providerId) {
+            activeModal = providerId;
+            const p = providers[providerId];
+            modalTitle.textContent = `Confirm ${p.name} Login`;
+            modalDesc.textContent = 'Browser window is already open. Click below once you are logged in.';
+            modalBtnOpen.textContent = `Re-open ${p.name} Login`;
+            modalBtnConfirm.disabled = false;
+            modalOverlay.style.display = 'flex';
+        }
+
+        function closeModal() {
+            activeModal = null;
+            modalOverlay.style.display = 'none';
+            modalBtnConfirm.disabled = true;
+        }
+
+        modalBtnClose.addEventListener('click', closeModal);
+        modalOverlay.addEventListener('click', e => { if (e.target === modalOverlay) closeModal(); });
+
+        modalBtnOpen.addEventListener('click', async () => {
+            if (!activeModal) return;
+            modalBtnOpen.disabled = true;
+            modalBtnOpen.textContent = 'Opening...';
+            try {
+                const res = await fetch(`/api/login/${activeModal}`, { method: 'POST' });
+                const data = await res.json();
+                if (data.success) {
+                    modalBtnConfirm.disabled = false;
+                    addSystemMsg(`${providers[activeModal].name} login window opened. Login then click "I've logged in".`);
+                    await fetchProviders();
+                } else {
+                    addErrorMsg('Error opening login: ' + (data.error || 'Unknown error'));
                 }
+            } catch (e) {
+                addErrorMsg('Network error: ' + e.message);
+            }
+            modalBtnOpen.disabled = false;
+            modalBtnOpen.textContent = `Open ${providers[activeModal]?.name || ''} Login`;
+        });
+
+        modalBtnConfirm.addEventListener('click', async () => {
+            if (!activeModal) return;
+            const pid = activeModal;
+            modalBtnConfirm.disabled = true;
+            modalBtnConfirm.textContent = 'Saving...';
+            try {
+                const res = await fetch(`/api/login/${pid}/confirm`, { method: 'POST' });
+                const data = await res.json();
+                if (data.success) {
+                    if (data.logged_in) {
+                        addSystemMsg(`${providers[pid].name} login saved! Ready to chat.`);
+                        closeModal();
+                        await fetchProviders();
+                    } else {
+                        addErrorMsg(`${providers[pid].name}: Login not detected. Please make sure you are fully logged in.`);
+                        modalBtnConfirm.disabled = false;
+                        modalBtnConfirm.textContent = "I've logged in";
+                    }
+                } else {
+                    addErrorMsg('Error confirming login: ' + (data.error || 'Unknown error'));
+                    modalBtnConfirm.disabled = false;
+                    modalBtnConfirm.textContent = "I've logged in";
+                }
+            } catch (e) {
+                addErrorMsg('Network error: ' + e.message);
+                modalBtnConfirm.disabled = false;
+                modalBtnConfirm.textContent = "I've logged in";
             }
         });
+
+        // ── Chat ────────────────────────────────────────────────────
+        btnSend.addEventListener('click', sendMessage);
+        messageInput.addEventListener('keydown', e => {
+            if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+        });
+
+        async function sendMessage() {
+            const msg = messageInput.value.trim();
+            if (!msg) return;
+            addUserMsg(msg);
+            messageInput.value = '';
+            btnSend.disabled = true;
+            btnSend.textContent = 'Sending...';
+
+            // Add a loading bubble
+            const loadingId = addLoadingMsg();
+
+            try {
+                const res = await fetch('/api/chat', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ message: msg }),
+                });
+                const data = await res.json();
+                removeLoadingMsg(loadingId);
+
+                if (data.success) {
+                    addAssistantMsg(data.response, data.provider);
+                    // Briefly highlight the provider card that responded
+                    setActiveCard(data.provider);
+                    setTimeout(clearActiveCard, 2000);
+                    await fetchProviders();
+                } else {
+                    addErrorMsg('Error: ' + (data.error || 'Unknown error'));
+                }
+            } catch (e) {
+                removeLoadingMsg(loadingId);
+                addErrorMsg('Network error: ' + e.message);
+            }
+
+            btnSend.disabled = false;
+            btnSend.textContent = 'Send';
+            updateSendButton();
+        }
+
+        // ── Message helpers ─────────────────────────────────────────
+        function addUserMsg(text) {
+            const d = document.createElement('div');
+            d.className = 'msg msg--user';
+            d.textContent = text;
+            chatMessages.appendChild(d);
+            chatMessages.scrollTop = chatMessages.scrollHeight;
+        }
+
+        function addAssistantMsg(text, providerId) {
+            const p = providers[providerId] || { name: providerId, color: '#888', icon: '?' };
+            const wrap = document.createElement('div');
+            wrap.className = 'msg msg--assistant';
+
+            const badge = document.createElement('span');
+            badge.className = 'provider-badge';
+            badge.style.background = p.color;
+            badge.textContent = p.name;
+
+            const pre = document.createElement('pre');
+            pre.className = 'msg-text';
+            pre.textContent = text;
+
+            const copyBtn = document.createElement('button');
+            copyBtn.className = 'copy-btn';
+            copyBtn.textContent = 'Copy';
+            copyBtn.addEventListener('click', () => {
+                navigator.clipboard.writeText(text).then(() => {
+                    copyBtn.textContent = 'Copied!';
+                    setTimeout(() => copyBtn.textContent = 'Copy', 2000);
+                });
+            });
+
+            wrap.appendChild(badge);
+            wrap.appendChild(pre);
+            wrap.appendChild(copyBtn);
+            chatMessages.appendChild(wrap);
+            chatMessages.scrollTop = chatMessages.scrollHeight;
+        }
+
+        function addSystemMsg(text) {
+            const d = document.createElement('div');
+            d.className = 'msg msg--system';
+            d.textContent = text;
+            chatMessages.appendChild(d);
+            chatMessages.scrollTop = chatMessages.scrollHeight;
+        }
+
+        function addErrorMsg(text) {
+            const d = document.createElement('div');
+            d.className = 'msg msg--error';
+            d.textContent = text;
+            chatMessages.appendChild(d);
+            chatMessages.scrollTop = chatMessages.scrollHeight;
+        }
+
+        let _loadingCounter = 0;
+        function addLoadingMsg() {
+            const id = 'loading-' + (++_loadingCounter);
+            const d = document.createElement('div');
+            d.className = 'msg msg--loading';
+            d.id = id;
+            d.innerHTML = '<span class="dot-pulse"></span><span class="dot-pulse"></span><span class="dot-pulse"></span>';
+            chatMessages.appendChild(d);
+            chatMessages.scrollTop = chatMessages.scrollHeight;
+            return id;
+        }
+
+        function removeLoadingMsg(id) {
+            const el = document.getElementById(id);
+            if (el) el.remove();
+        }
+
+        // ── Init ────────────────────────────────────────────────────
+        startPolling();
+    })();
     </script>
 </body>
 </html>

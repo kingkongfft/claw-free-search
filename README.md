@@ -51,3 +51,7 @@ This will show a menu with options:
 - You need to manually login the first time (no password storage for security)
 - Cookies are saved locally and reused for subsequent searches
 - If authentication expires, run `--login` again
+
+## License
+
+Released under the [MIT License](LICENSE).
