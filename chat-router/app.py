@@ -62,13 +62,6 @@ PROVIDERS: dict[str, dict] = {
         "color": "#00b96b",
         "icon": "B",
     },
-    "google": {
-        "name": "Google AI",
-        "url": "https://www.google.com/search?udm=50&aep=11",
-        "storage": Path("google_storage.json"),
-        "color": "#ea4335",
-        "icon": "G",
-    },
 }
 
 # Provider-specific DOM selectors.
@@ -85,15 +78,14 @@ PROVIDER_CONFIGS: dict[str, dict] = {
             '[class*="input"] textarea',
         ],
         "segment_selectors": [
-            '[class*="segment"]',
-            '[class*="turn--"]',
-            '[class*="reply"]',
-            '[class*="ai-message"]',
-            '[class*="assistant"]',
+            '[class*="segment-assistant"]',
+            '[class*="paragraph"]',
+            '[class*="markdown"]',
+            '[class*="segment-content"]',
         ],
         "generating_sel": (
-            '[class*="loading"], [class*="generating"], '
-            '[class*="stop"], .stop-btn, [class*="cursor-blink"]'
+            '[class*="cursor-blink"], [class*="generating"], '
+            'button[class*="stop"], [class*="streaming"]'
         ),
         "noise_patterns": [
             "/^Expand Sidebar/",
@@ -160,47 +152,6 @@ PROVIDER_CONFIGS: dict[str, dict] = {
             const text = document.body.innerText || '';
             return text.includes('\u65b0\u5efa\u5bf9\u8bdd') || text.includes('New Chat')
                 || document.querySelectorAll('[class*="avatar"]').length > 0;
-        }""",
-    },
-    "google": {
-        # Google AI Mode (udm=50). The search box is the input; the AI answer
-        # renders into a results container after submitting.
-        "input_selectors": [
-            'textarea[name="q"]',
-            'textarea[aria-label*="Search"]',
-            'div[contenteditable="true"][role="combobox"]',
-            'div[contenteditable="true"]',
-            "textarea",
-        ],
-        "segment_selectors": [
-            '[data-rl][role="presentation"]',
-            'div[data-async-context] [class*="markdown"]',
-            "[jsname][data-mid]",
-            '[class*="markdown"]',
-            "[data-attrid]",
-        ],
-        "generating_sel": (
-            '[role="progressbar"], [class*="loading"], '
-            '[aria-busy="true"], [class*="thinking"]'
-        ),
-        "noise_patterns": [
-            "/^Search$/",
-            "/^Images$/",
-            "/^Videos$/",
-            "/^News$/",
-            "/^Maps$/",
-            "/^Shopping$/",
-            "/^All$/",
-            "/^Sign in$/",
-            "/^AI Mode/",
-            "/^About \\d+ results/",
-        ],
-        # Google search works without sign-in; AI Mode availability can depend on
-        # account/region. We just confirm the search UI loaded.
-        "login_check_js": """() => {
-            return document.querySelector('textarea[name="q"]') !== null
-                || document.querySelector('div[contenteditable="true"][role="combobox"]') !== null
-                || (document.body.innerText || '').length > 0;
         }""",
     },
 }
@@ -329,6 +280,16 @@ _bstate: dict = {
     "active_provider": None,  # provider currently serving a chat request
 }
 
+# Long-lived headless browser used to serve chat requests. The browser and its
+# Playwright driver are started once (lazily) and reused; each provider gets its
+# own cached context + page so navigation/login-state injection only happens on
+# first use instead of on every request.
+_chat_bstate: dict = {
+    "pw": None,
+    "browser": None,
+    "pages": {},  # provider -> {"context": ctx, "page": page}
+}
+
 # ---------------------------------------------------------------------------
 # Browser-thread event loop
 # ---------------------------------------------------------------------------
@@ -413,6 +374,122 @@ async def _reset_browser():
     )
 
 
+# ---------------------------------------------------------------------------
+# Long-lived chat browser (perf: reused across requests, one page per provider)
+# ---------------------------------------------------------------------------
+
+
+async def _ensure_chat_browser():
+    """Start the shared headless chat browser once; reuse afterwards."""
+    if _chat_bstate["browser"] is not None:
+        return
+    pw = await async_playwright().start()
+    browser = await pw.chromium.launch(headless=True)
+    _chat_bstate["pw"] = pw
+    _chat_bstate["browser"] = browser
+    _chat_bstate["pages"] = {}
+
+
+async def _get_chat_page(provider: str):
+    """Return a ready, logged-in page for *provider*, creating it on first use.
+
+    The page is cached and reused on subsequent requests so we skip the
+    cold-start cost (launch + navigate + login-state injection) every time.
+    """
+    await _ensure_chat_browser()
+
+    cached = _chat_bstate["pages"].get(provider)
+    if cached is not None:
+        page = cached["page"]
+        # Cheap liveness check; if the page died, drop it and recreate below.
+        try:
+            if not page.is_closed():
+                return page
+        except Exception:
+            pass
+        await _invalidate_chat_page(provider)
+
+    cfg = PROVIDER_CONFIGS[provider]
+    prov = PROVIDERS[provider]
+    storage = load_storage(provider)
+    cookies: list = storage.get("cookies", [])
+    local_storage: dict = storage.get("localStorage", {})
+
+    context = await _chat_bstate["browser"].new_context(
+        viewport={"width": 1280, "height": 720},
+        user_agent=USER_AGENT,
+    )
+    if cookies:
+        await context.add_cookies(cookies)
+
+    # (E) Inject localStorage *before* any navigation via an init script so we
+    # don't need the extra "navigate -> set -> reload" round-trip.
+    if local_storage:
+        await context.add_init_script(
+            "(() => { const items = "
+            + json.dumps(local_storage)
+            + "; try { for (const k in items) localStorage.setItem(k, items[k]); }"
+            + " catch (e) {} })();"
+        )
+
+    page = await context.new_page()
+    # (C) domcontentloaded instead of networkidle (hangs on long-poll sites).
+    try:
+        await page.goto(prov["url"], wait_until="domcontentloaded", timeout=30000)
+    except Exception:
+        pass
+
+    # (C) Wait for the actual input element instead of a blind sleep.
+    await _find_chat_input(page, cfg)
+
+    _chat_bstate["pages"][provider] = {"context": context, "page": page}
+    return page
+
+
+async def _invalidate_chat_page(provider: str):
+    """Drop a provider's cached page/context (e.g. after re-login)."""
+    cached = _chat_bstate["pages"].pop(provider, None)
+    if not cached:
+        return
+    try:
+        await cached["context"].close()
+    except Exception:
+        pass
+
+
+async def _close_chat_browser():
+    for cached in list(_chat_bstate["pages"].values()):
+        try:
+            await cached["context"].close()
+        except Exception:
+            pass
+    _chat_bstate["pages"] = {}
+    if _chat_bstate["browser"]:
+        try:
+            await _chat_bstate["browser"].close()
+        except Exception:
+            pass
+    if _chat_bstate["pw"]:
+        try:
+            await _chat_bstate["pw"].stop()
+        except Exception:
+            pass
+    _chat_bstate["browser"] = None
+    _chat_bstate["pw"] = None
+
+
+async def _find_chat_input(page, cfg: dict):
+    """Locate a visible chat input element, trying configured selectors."""
+    for selector in cfg["input_selectors"]:
+        try:
+            el = await page.wait_for_selector(selector, timeout=8000)
+            if el and await el.is_visible():
+                return el
+        except Exception:
+            continue
+    return None
+
+
 async def _cmd_login(provider: str):
     if provider not in PROVIDERS:
         raise ValueError(f"Unknown provider: {provider}")
@@ -482,6 +559,10 @@ async def _cmd_login_confirm(provider: str) -> dict:
 
     _bstate["login_window_open"] = False
 
+    # A fresh session was just saved — drop any cached chat page so the next
+    # request rebuilds it with the new cookies/localStorage.
+    await _invalidate_chat_page(provider)
+
     # Close the visible browser
     await _reset_browser()
 
@@ -495,8 +576,11 @@ async def _cmd_login_confirm(provider: str) -> dict:
 
 
 async def _cmd_chat(message: str, provider: str | None = None) -> dict:
-    """Send a message via a fresh headless browser for the given provider.
+    """Send a message via the long-lived headless browser for *provider*.
 
+    Reuses a cached, already-logged-in page (perf), fills the input in one shot,
+    and detects completion via an injected MutationObserver instead of polling
+    the whole DOM every couple of seconds.
     If provider is None, the round-robin selects the next ready one.
     """
     if provider is None:
@@ -512,142 +596,137 @@ async def _cmd_chat(message: str, provider: str | None = None) -> dict:
     cfg = PROVIDER_CONFIGS[provider]
     prov = PROVIDERS[provider]
 
-    storage = load_storage(provider)
-    cookies: list = storage.get("cookies", [])
-    local_storage: dict = storage.get("localStorage", {})
-
-    pw = await async_playwright().start()
     try:
-        browser = await pw.chromium.launch(headless=True)
-        context = await browser.new_context(
-            viewport={"width": 1280, "height": 720},
-            user_agent=USER_AGENT,
-        )
-        if cookies:
-            await context.add_cookies(cookies)
+        page = await _get_chat_page(provider)
 
-        page = await context.new_page()
-        await page.goto(prov["url"])
-        await page.wait_for_load_state("networkidle")
-
-        if local_storage:
-            await page.evaluate(
-                """(items) => {
-                    for (const [k, v] of Object.entries(items)) {
-                        localStorage.setItem(k, v);
-                    }
-                }""",
-                local_storage,
-            )
-            await page.reload()
-            await page.wait_for_load_state("networkidle")
-
-        await asyncio.sleep(2)
-
-        # Find input field
-        input_field = None
-        for selector in cfg["input_selectors"]:
-            try:
-                el = await page.wait_for_selector(selector, timeout=5000)
-                if el and await el.is_visible():
-                    input_field = el
-                    break
-            except Exception:
-                continue
-
+        input_field = await _find_chat_input(page, cfg)
+        if not input_field:
+            # Cached page may be stale; rebuild once and retry.
+            await _invalidate_chat_page(provider)
+            page = await _get_chat_page(provider)
+            input_field = await _find_chat_input(page, cfg)
         if not input_field:
             raise RuntimeError(
                 f"Could not find chat input on {prov['name']} — "
                 "session may have expired, please re-login."
             )
 
-        # Type and send
-        await input_field.evaluate("el => el.focus()")
-        await asyncio.sleep(0.2)
-        await page.keyboard.press("Control+a")
-        await page.keyboard.press("Delete")
-        await asyncio.sleep(0.1)
-        await page.keyboard.type(message, delay=20)
-        await asyncio.sleep(0.3)
-        await page.keyboard.press("Enter")
-        await asyncio.sleep(3)
-
-        # Build the JS extractor from provider config
+        # (B) Install the streaming observer BEFORE sending, capturing the
+        # current best-candidate text so we can tell when a *new* reply appears.
         segment_sel_js = json.dumps(cfg["segment_selectors"])
         noise_patterns_js = (
             ", ".join(cfg["noise_patterns"]) if cfg["noise_patterns"] else ""
         )
-        generating_sel = cfg["generating_sel"]
+        generating_sel = json.dumps(cfg["generating_sel"])
 
-        extractor_js = f"""() => {{
+        observer_js = f"""(userMsg) => {{
             const segmentSelectors = {segment_sel_js};
             const noisePatterns = [{noise_patterns_js}];
-            function isNoise(text) {{
-                return noisePatterns.some(p => p.test(text.trim()));
+            function isNoise(t) {{ return noisePatterns.some(p => p.test(t.trim())); }}
+            function candidates() {{
+                let out = [];
+                for (const sel of segmentSelectors) {{
+                    document.querySelectorAll(sel).forEach(el => {{
+                        const t = (el.innerText || '').trim();
+                        // drop noise and the echoed user prompt itself
+                        if (t.length > 10 && !isNoise(t) && t !== userMsg) out.push(t);
+                    }});
+                }}
+                if (out.length === 0) {{
+                    document.querySelectorAll('[class*="markdown"], [class*="prose"]').forEach(el => {{
+                        const t = (el.innerText || '').trim();
+                        if (t.length > 10 && !isNoise(t) && t !== userMsg) out.push(t);
+                    }});
+                }}
+                return out;
             }}
-            let candidates = [];
-            for (const sel of segmentSelectors) {{
-                document.querySelectorAll(sel).forEach(el => {{
-                    const t = (el.innerText || '').trim();
-                    if (t.length > 30 && !isNoise(t)) candidates.push(t);
-                }});
+            // Snapshot text that already exists before sending (welcome blurbs,
+            // prior turns) so we only surface a NEW reply.
+            const baseline = new Set(candidates());
+            const st = {{ text: '', changed: Date.now() }};
+            window.__chatState = st;
+            window.__chatPick = () => {{
+                const cs = candidates();
+                for (let i = cs.length - 1; i >= 0; i--) {{
+                    if (!baseline.has(cs[i])) return cs[i];
+                }}
+                return '';
+            }};
+            if (window.__chatObserver) window.__chatObserver.disconnect();
+            const update = () => {{
+                const pick = window.__chatPick();
+                if (pick && pick !== st.text) {{ st.text = pick; st.changed = Date.now(); }}
+            }};
+            const obs = new MutationObserver(update);
+            obs.observe(document.body, {{ childList: true, subtree: true, characterData: true }});
+            window.__chatObserver = obs;
+            return baseline.size;
+        }}"""
+        await page.evaluate(observer_js, message)
+
+        # Send the message.
+        await _fill_input(page, input_field, message)
+        await page.keyboard.press("Enter")
+
+        # (B) Read state at a short interval (also re-pick here in case the
+        # observer missed a mutation) and finish when the reply text is stable.
+        read_state_js = f"""() => {{
+            const st = window.__chatState || {{ text: '', changed: 0 }};
+            if (window.__chatPick) {{
+                const pick = window.__chatPick();
+                if (pick && pick !== st.text) {{ st.text = pick; st.changed = Date.now(); }}
             }}
-            if (candidates.length === 0) {{
-                document.querySelectorAll('[class*="markdown"], [class*="prose"]').forEach(el => {{
-                    const t = (el.innerText || '').trim();
-                    if (t.length > 30 && !isNoise(t)) candidates.push(t);
-                }});
-            }}
-            if (candidates.length === 0) return {{ text: '', generating: false }};
-            const best = candidates[candidates.length - 1];
-            const generating = document.querySelectorAll('{generating_sel}').length > 0;
-            return {{ text: best, generating }};
+            const generating = document.querySelectorAll({generating_sel}).length > 0;
+            return {{ text: st.text, idleMs: Date.now() - st.changed, generating }};
         }}"""
 
-        # Poll for response
         response = ""
+        # Finish when the reply text has been stable (no growth) long enough.
+        # If a generating indicator is still present we require a longer quiet
+        # window; otherwise a short one. This stays robust even when a
+        # provider's "generating" selector matches some always-present element.
+        quiet_idle_ms = 900  # stable window when generation looks done
+        quiet_busy_ms = 2500  # stable window while still "generating"
         start = time.time()
-        last_text = ""
-
+        got_first = False
         while time.time() - start < 90:
             try:
-                result = await page.evaluate(extractor_js)
-                text = result.get("text", "")
-                generating = result.get("generating", False)
-                if text and text != message and len(text) > 20:
-                    if not generating and text == last_text:
-                        response = text
-                        break
-                    last_text = text
+                state = await page.evaluate(read_state_js)
             except Exception as exc:
-                print(f"Poll error ({provider}): {exc}")
-            await asyncio.sleep(2)
+                print(f"Read error ({provider}): {exc}")
+                await asyncio.sleep(0.5)
+                continue
+            text = state.get("text", "")
+            idle_ms = state.get("idleMs", 0)
+            generating = state.get("generating", False)
+            if text and len(text) > 10:
+                got_first = True
+                threshold = quiet_busy_ms if generating else quiet_idle_ms
+                if idle_ms >= threshold:
+                    response = text
+                    break
+            # Poll fast while streaming; back off slightly before first token.
+            await asyncio.sleep(0.3 if got_first else 0.5)
 
-        # Persist updated session
+        # Persist refreshed session (cookies can rotate); keep the page open.
         try:
-            updated_cookies = await context.cookies()
-            updated_local: dict = await page.evaluate("""() => {
-                const local = {};
-                for (let i = 0; i < localStorage.length; i++) {
-                    const key = localStorage.key(i);
-                    local[key] = localStorage.getItem(key);
-                }
-                return local;
-            }""")
-            save_storage(provider, updated_cookies, updated_local)
+            cached = _chat_bstate["pages"].get(provider)
+            if cached:
+                updated_cookies = await cached["context"].cookies()
+                updated_local: dict = await page.evaluate("""() => {
+                    const local = {};
+                    for (let i = 0; i < localStorage.length; i++) {
+                        const key = localStorage.key(i);
+                        local[key] = localStorage.getItem(key);
+                    }
+                    return local;
+                }""")
+                save_storage(provider, updated_cookies, updated_local)
         except Exception as e:
             print(f"Failed to update storage for {provider}: {e}")
 
     finally:
         _bstate["active_provider"] = None
-        try:
-            await browser.close()
-        except Exception:
-            pass
-        try:
-            await pw.stop()
-        except Exception:
-            pass
 
     if response:
         return {"success": True, "response": response, "provider": provider}
@@ -656,8 +735,37 @@ async def _cmd_chat(message: str, provider: str | None = None) -> dict:
     )
 
 
+async def _fill_input(page, input_field, message: str):
+    """Set the chat input value reliably, including CJK text.
+
+    Playwright's ``fill`` uses insertText and works for both textareas and
+    contenteditable editors, and unlike per-key ``type`` it inputs CJK
+    characters correctly in headless Chromium (``type`` can turn them into
+    "?"). We fall back to ``insert_text`` then ``type`` only if fill fails.
+    """
+    try:
+        await input_field.click()
+    except Exception:
+        pass
+    try:
+        await input_field.fill("")
+        await input_field.fill(message)
+        return
+    except Exception:
+        pass
+    # Fallbacks for editors that reject fill().
+    try:
+        await input_field.evaluate("el => el.focus()")
+        await page.keyboard.insert_text(message)
+        return
+    except Exception:
+        pass
+    await page.keyboard.type(message)
+
+
 async def _cmd_close():
     await _reset_browser()
+    await _close_chat_browser()
 
 
 def _cmd_providers() -> dict:
