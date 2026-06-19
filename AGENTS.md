@@ -4,18 +4,18 @@ Orientation for agentic coding assistants working in this repository.
 
 ## Project Overview
 
-Python tools for chatting with web AI assistants (Kimi, DeepSeek, Doubao) without a paid
-API key, by driving a real Chromium browser via Playwright and replaying a manual login.
+Python tools for chatting with free web AI assistants (Google AI, DuckDuckGo AI,
+Perplexity) without any API key or login, by driving a real Chromium browser via
+Playwright.
 
-1. **Root CLI scripts** (`kimi_search.py`, `kimi_auth.py`) — open a visible browser for
-   manual Kimi login, save cookies, reuse them for queries.
+1. **Root CLI scripts** (`kimi_search.py`, `kimi_auth.py`) — legacy Kimi-specific
+   tools (no longer used by chat-router).
 2. **`chat-router/`** — a Flask app (`app.py`) that exposes a multi-provider chat router
-   over REST. Requests are load-balanced **round-robin** across all providers that have a
-   saved session file. Single-page vanilla-JS UI in `templates/index.html`.
+   over REST. Requests are load-balanced **round-robin** across all three free providers.
+   Single-page vanilla-JS UI in `templates/index.html`.
 
-Core technique: launch Chromium, let the user log in manually, capture cookies +
-localStorage to `<provider>_storage.json`, then spin up a headless browser per request
-using that saved state.
+Core technique: launch headless Chromium per request, navigate to the provider's search/chat
+page with the user's query, and extract the AI-generated response from the DOM.
 
 ## Repository Layout
 
@@ -110,11 +110,10 @@ Prefer `from pathlib import Path` and `Path` objects over `os.path` and raw stri
 ### Naming
 | Kind | Convention | Example |
 |------|-----------|---------|
-| Module | `snake_case` | `kimi_auth.py` |
-| Class | `PascalCase` | `KimiAuth`, `KimiSearch` |
-| Function / method | `snake_case` | `load_auth()`, `_cmd_chat()` |
-| Internal/browser-thread helpers | `_snake_case` | `_browser_loop()`, `_bstate` |
-| Constants / registries | `UPPER_SNAKE_CASE` | `KIMI_URL`, `PROVIDERS`, `USER_AGENT` |
+| Module | `snake_case` | `app.py` |
+| Function / method | `snake_case` | `_cmd_chat()` |
+| Internal/browser-thread helpers | `_snake_case` | `_browser_loop()`, `_chat_bstate` |
+| Constants / registries | `UPPER_SNAKE_CASE` | `PROVIDERS`, `USER_AGENT` |
 
 ### Types
 Annotate all function signatures. Use built-in generics (`dict[str, str]`) and `X | None`
@@ -134,12 +133,12 @@ async def _cmd_chat(message: str, provider: str | None = None) -> dict:
 - Long-lived sessions: explicit `.start()` / `.stop()`; standalone scripts: `with` form.
 - Prefer `page.wait_for_selector(sel, timeout=N)` over bare `time.sleep()`.
 - Guard `wait_for_load_state` with a timeout (e.g. `domcontentloaded`, `timeout=5000`) —
-  `networkidle` can hang on sites with persistent connections (e.g. Doubao).
+  `networkidle` can hang on sites with persistent connections (e.g. DuckDuckGo).
 
 ### Flask
 - Routes via `@app.route(path, methods=[...])`; return `jsonify(...)` everywhere.
 - Success: `{"success": True, ...}` (HTTP 200). Error: `{"error": "..."}` (4xx/5xx).
-- Multi-provider routes use `/api/login/<provider>` etc.; keep Kimi backward-compat aliases.
+- Multi-provider routes use `/api/chat` with optional `provider` field in the body.
 
 ### File I/O
 - Always `encoding="utf-8"`.
@@ -154,6 +153,6 @@ comments for non-obvious selectors and Playwright workarounds.
 - No API keys or passwords stored; only manually captured session state lives locally.
 
 ## Provider Registry
-New backends are added to the `PROVIDERS` dict and `PROVIDER_CONFIGS` (selectors, login
-check JS) in `chat-router/app.py`. A provider joins the round-robin only once its
-`<provider>_storage.json` exists. See `chat-router/ROUTER_PLAN.md` for design details.
+New backends are added to the `PROVIDERS` dict in `chat-router/app.py`. All providers
+are always ready — no login, no session files. Each provider has a `url` template with
+`{query}` placeholder, a response extractor function, and visual metadata (color, icon).

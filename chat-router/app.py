@@ -2,9 +2,9 @@
 """
 AI Web Chat Proxy Router
 ========================
-Routes chat requests across multiple AI backends (Kimi, DeepSeek, Doubao) using a
-round-robin strategy.  Only backends that have a saved session file are included in
-the rotation.
+Routes chat requests across multiple free AI backends (Google AI, DuckDuckGo AI,
+Perplexity) using a round-robin strategy.  All providers are always ready — no
+login required.
 
 Architecture
 ------------
@@ -15,11 +15,9 @@ event loop.  Flask handler threads communicate with the browser thread via a
 """
 
 import asyncio
-import json
 import queue
 import threading
-import time
-from pathlib import Path
+from urllib.parse import quote_plus
 
 from flask import Flask, jsonify, render_template, request
 from playwright.async_api import async_playwright
@@ -33,169 +31,56 @@ app = Flask(__name__)
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/120.0.0.0 Safari/537.36"
+    "Chrome/131.0.0.0 Safari/537.36"
 )
 
+STEALTH_ARGS = [
+    "--disable-blink-features=AutomationControlled",
+    "--disable-features=IsolateOrigins,site-per-process",
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--disable-infobars",
+    "--disable-background-networking",
+]
+
+STEALTH_INIT_JS = """
+Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+Object.defineProperty(navigator, 'plugins', {
+    get: () => [1, 2, 3, 4, 5],
+});
+Object.defineProperty(navigator, 'languages', {
+    get: () => ['en-US', 'en'],
+});
+window.chrome = { runtime: {} };
+"""
+
 # ---------------------------------------------------------------------------
-# Provider registry
+# Provider registry — all free, no login needed
 # ---------------------------------------------------------------------------
 
 PROVIDERS: dict[str, dict] = {
-    "kimi": {
-        "name": "Kimi",
-        "url": "https://www.kimi.com",
-        "storage": Path("kimi_storage.json"),
-        "color": "#7c5cbf",
-        "icon": "K",
+    "google": {
+        "name": "Google AI",
+        "url": "https://www.google.com/search?q={query}&udm=50",
+        "color": "#4285f4",
+        "icon": "G",
+        "type": "search",
     },
-    "deepseek": {
-        "name": "DeepSeek",
-        "url": "https://chat.deepseek.com/",
-        "storage": Path("deepseek_storage.json"),
-        "color": "#1a73e8",
+    "duckduckgo": {
+        "name": "DuckDuckGo AI",
+        "url": "https://duck.ai/",
+        "color": "#de5833",
         "icon": "D",
+        "type": "chat",
     },
-    "doubao": {
-        "name": "Doubao",
-        "url": "https://www.doubao.com/chat/",
-        "storage": Path("doubao_storage.json"),
-        "color": "#00b96b",
-        "icon": "B",
-    },
-}
-
-# Provider-specific DOM selectors.
-# input_selectors  : tried in order to find the chat input element
-# segment_selectors: tried in order to find AI reply containers
-# generating_sel   : querySelector to detect if generation is still in progress
-# noise_patterns   : JS regex literals (as strings) to skip UI-chrome text
-PROVIDER_CONFIGS: dict[str, dict] = {
-    "kimi": {
-        "input_selectors": [
-            'div[contenteditable="true"]',
-            "textarea",
-            '[class*="editor"]',
-            '[class*="input"] textarea',
-        ],
-        "segment_selectors": [
-            '[class*="segment-assistant"]',
-            '[class*="paragraph"]',
-            '[class*="markdown"]',
-            '[class*="segment-content"]',
-        ],
-        "generating_sel": (
-            '[class*="cursor-blink"], [class*="generating"], '
-            'button[class*="stop"], [class*="streaming"]'
-        ),
-        "noise_patterns": [
-            "/^Expand Sidebar/",
-            "/^Copy$/",
-            "/^Share$/",
-            "/^Search/",
-            "/^K2\\./",
-            "/^Ask away/",
-            "/^Pics work/",
-            "/^New Chat/",
-            "/^\\d+ results/",
-        ],
-        # JS to detect login success on the page
-        "login_check_js": """() => {
-            const text = document.body.innerText || '';
-            const hasAvatar = document.querySelectorAll('[class*="avatar"]').length > 0;
-            const hasNewChat = text.includes('New Chat') || text.includes('\u65b0\u5bf9\u8bdd');
-            return hasAvatar || hasNewChat;
-        }""",
-    },
-    "deepseek": {
-        "input_selectors": [
-            "textarea#chat-input",
-            '[class*="chat-input"] textarea',
-            'div[contenteditable="true"]',
-            "textarea",
-        ],
-        "segment_selectors": [
-            '[class*="ds-markdown"]',
-            '[class*="message-content"]',
-            '[class*="assistant-message"]',
-            '[class*="markdown"]',
-        ],
-        "generating_sel": (
-            '[class*="loading"], [class*="stop-btn"], '
-            '[class*="generating"], [class*="thinking"]'
-        ),
-        "noise_patterns": [],
-        "login_check_js": """() => {
-            const text = document.body.innerText || '';
-            return text.includes('New chat') || text.includes('\u65b0\u5bf9\u8bdd')
-                || document.querySelectorAll('[class*="avatar"]').length > 0
-                || document.querySelectorAll('[class*="user-info"]').length > 0;
-        }""",
-    },
-    "doubao": {
-        "input_selectors": [
-            '[class*="input-area"] [contenteditable]',
-            '[class*="chat-input"] textarea',
-            'div[contenteditable="true"]',
-            "textarea",
-        ],
-        "segment_selectors": [
-            '[class*="chat-content"]',
-            '[class*="bot-message"]',
-            '[class*="assistant"]',
-            '[class*="markdown"]',
-        ],
-        "generating_sel": (
-            '[class*="loading"], [class*="stop"], [class*="generating"]'
-        ),
-        "noise_patterns": [],
-        "login_check_js": """() => {
-            const text = document.body.innerText || '';
-            return text.includes('\u65b0\u5efa\u5bf9\u8bdd') || text.includes('New Chat')
-                || document.querySelectorAll('[class*="avatar"]').length > 0;
-        }""",
+    "perplexity": {
+        "name": "Perplexity",
+        "url": "https://www.perplexity.ai/search?q={query}",
+        "color": "#20b2aa",
+        "icon": "P",
+        "type": "search",
     },
 }
-
-# ---------------------------------------------------------------------------
-# Storage helpers  (Flask-thread safe — file I/O only)
-# ---------------------------------------------------------------------------
-
-
-def load_storage(provider: str) -> dict:
-    """Load persisted cookies + localStorage for a provider.
-
-    Returns ``{"cookies": [...], "localStorage": {...}}``.
-    Handles both the current unified format and the legacy localStorage-only format.
-    """
-    path = PROVIDERS[provider]["storage"]
-    if not path.exists():
-        return {"cookies": [], "localStorage": {}}
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    if "cookies" in data:
-        return data
-    return {"cookies": [], "localStorage": data.get("localStorage", {})}
-
-
-def save_storage(provider: str, cookies: list, local_storage: dict) -> None:
-    """Persist cookies + localStorage for a provider."""
-    path = PROVIDERS[provider]["storage"]
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(
-            {"cookies": cookies, "localStorage": local_storage},
-            f,
-            indent=2,
-            ensure_ascii=False,
-        )
-
-
-def provider_ready(provider: str) -> bool:
-    return PROVIDERS[provider]["storage"].exists()
-
-
-def ready_providers() -> list[str]:
-    return [k for k in PROVIDERS if provider_ready(k)]
-
 
 # ---------------------------------------------------------------------------
 # Round-robin
@@ -206,13 +91,13 @@ _rr_lock = threading.Lock()
 
 
 def _next_provider() -> str | None:
-    """Return the key of the next ready provider (round-robin), or None."""
+    """Return the key of the next provider (round-robin)."""
     global _rr_index
     with _rr_lock:
-        rp = ready_providers()
-        if not rp:
+        keys = list(PROVIDERS.keys())
+        if not keys:
             return None
-        key = rp[_rr_index % len(rp)]
+        key = keys[_rr_index % len(keys)]
         _rr_index += 1
         return key
 
@@ -246,7 +131,7 @@ class _Result:
         self.error = exc
         self._event.set()
 
-    def wait(self, timeout: float = 120.0):
+    def wait(self, timeout: float = 180.0):
         if not self._event.wait(timeout):
             raise TimeoutError("Browser thread did not respond in time")
         if self.error is not None:
@@ -255,10 +140,7 @@ class _Result:
 
 
 def _send(cmd: str, **payload) -> tuple:
-    """Send a command to the browser thread; block until complete.
-
-    Returns ``(value, http_status)``.
-    """
+    """Send a command to the browser thread; block until complete."""
     result = _Result()
     _cmd_queue.put({"cmd": cmd, "payload": payload, "result": result})
     value = result.wait()
@@ -269,25 +151,9 @@ def _send(cmd: str, **payload) -> tuple:
 # Browser-thread state
 # ---------------------------------------------------------------------------
 
-# Holds the visible login browser (one at a time).
-_bstate: dict = {
-    "pw": None,
-    "browser": None,
-    "context": None,
-    "page": None,
-    "login_provider": None,  # which provider's login window is open
-    "login_window_open": False,
-    "active_provider": None,  # provider currently serving a chat request
-}
-
-# Long-lived headless browser used to serve chat requests. The browser and its
-# Playwright driver are started once (lazily) and reused; each provider gets its
-# own cached context + page so navigation/login-state injection only happens on
-# first use instead of on every request.
 _chat_bstate: dict = {
     "pw": None,
     "browser": None,
-    "pages": {},  # provider -> {"context": ctx, "page": page}
 }
 
 # ---------------------------------------------------------------------------
@@ -303,24 +169,7 @@ async def _browser_loop():
         payload: dict = item["payload"]
         result: _Result = item["result"]
         try:
-            if cmd == "login":
-                await _cmd_login(payload["provider"])
-                p = payload["provider"]
-                result.set_ok(
-                    {
-                        "success": True,
-                        "message": f"Browser opened. Please login to {PROVIDERS[p]['name']}.",
-                    }
-                )
-
-            elif cmd == "login_confirm":
-                out = await _cmd_login_confirm(payload["provider"])
-                if "_client_error" in out:
-                    result.set_client_error(out["_client_error"])
-                else:
-                    result.set_ok(out)
-
-            elif cmd == "chat":
+            if cmd == "chat":
                 out = await _cmd_chat(payload["message"], payload.get("provider"))
                 if "_client_error" in out:
                     result.set_client_error(out["_client_error"])
@@ -330,9 +179,6 @@ async def _browser_loop():
             elif cmd == "close":
                 await _cmd_close()
                 result.set_ok({"success": True})
-
-            elif cmd == "providers":
-                result.set_ok(_cmd_providers())
 
             elif cmd == "shutdown":
                 await _cmd_close()
@@ -347,123 +193,24 @@ async def _browser_loop():
 
 
 # ---------------------------------------------------------------------------
-# Individual command implementations
-# ---------------------------------------------------------------------------
-
-
-async def _reset_browser():
-    for key in ("page", "context", "browser", "pw"):
-        obj = _bstate.get(key)
-        if obj:
-            try:
-                if key == "pw":
-                    await obj.stop()
-                else:
-                    await obj.close()
-            except Exception:
-                pass
-    _bstate.update(
-        {
-            "pw": None,
-            "browser": None,
-            "context": None,
-            "page": None,
-            "login_provider": None,
-            "login_window_open": False,
-        }
-    )
-
-
-# ---------------------------------------------------------------------------
-# Long-lived chat browser (perf: reused across requests, one page per provider)
+# Chat browser helpers
 # ---------------------------------------------------------------------------
 
 
 async def _ensure_chat_browser():
-    """Start the shared headless chat browser once; reuse afterwards."""
+    """Start the shared headless chat browser once with stealth args."""
     if _chat_bstate["browser"] is not None:
         return
     pw = await async_playwright().start()
-    browser = await pw.chromium.launch(headless=True)
+    browser = await pw.chromium.launch(
+        headless=True,
+        args=STEALTH_ARGS,
+    )
     _chat_bstate["pw"] = pw
     _chat_bstate["browser"] = browser
-    _chat_bstate["pages"] = {}
-
-
-async def _get_chat_page(provider: str):
-    """Return a ready, logged-in page for *provider*, creating it on first use.
-
-    The page is cached and reused on subsequent requests so we skip the
-    cold-start cost (launch + navigate + login-state injection) every time.
-    """
-    await _ensure_chat_browser()
-
-    cached = _chat_bstate["pages"].get(provider)
-    if cached is not None:
-        page = cached["page"]
-        # Cheap liveness check; if the page died, drop it and recreate below.
-        try:
-            if not page.is_closed():
-                return page
-        except Exception:
-            pass
-        await _invalidate_chat_page(provider)
-
-    cfg = PROVIDER_CONFIGS[provider]
-    prov = PROVIDERS[provider]
-    storage = load_storage(provider)
-    cookies: list = storage.get("cookies", [])
-    local_storage: dict = storage.get("localStorage", {})
-
-    context = await _chat_bstate["browser"].new_context(
-        viewport={"width": 1280, "height": 720},
-        user_agent=USER_AGENT,
-    )
-    if cookies:
-        await context.add_cookies(cookies)
-
-    # (E) Inject localStorage *before* any navigation via an init script so we
-    # don't need the extra "navigate -> set -> reload" round-trip.
-    if local_storage:
-        await context.add_init_script(
-            "(() => { const items = "
-            + json.dumps(local_storage)
-            + "; try { for (const k in items) localStorage.setItem(k, items[k]); }"
-            + " catch (e) {} })();"
-        )
-
-    page = await context.new_page()
-    # (C) domcontentloaded instead of networkidle (hangs on long-poll sites).
-    try:
-        await page.goto(prov["url"], wait_until="domcontentloaded", timeout=30000)
-    except Exception:
-        pass
-
-    # (C) Wait for the actual input element instead of a blind sleep.
-    await _find_chat_input(page, cfg)
-
-    _chat_bstate["pages"][provider] = {"context": context, "page": page}
-    return page
-
-
-async def _invalidate_chat_page(provider: str):
-    """Drop a provider's cached page/context (e.g. after re-login)."""
-    cached = _chat_bstate["pages"].pop(provider, None)
-    if not cached:
-        return
-    try:
-        await cached["context"].close()
-    except Exception:
-        pass
 
 
 async def _close_chat_browser():
-    for cached in list(_chat_bstate["pages"].values()):
-        try:
-            await cached["context"].close()
-        except Exception:
-            pass
-    _chat_bstate["pages"] = {}
     if _chat_bstate["browser"]:
         try:
             await _chat_bstate["browser"].close()
@@ -478,312 +225,339 @@ async def _close_chat_browser():
     _chat_bstate["pw"] = None
 
 
-async def _find_chat_input(page, cfg: dict):
-    """Locate a visible chat input element, trying configured selectors."""
-    for selector in cfg["input_selectors"]:
-        try:
-            el = await page.wait_for_selector(selector, timeout=8000)
-            if el and await el.is_visible():
-                return el
-        except Exception:
-            continue
-    return None
-
-
-async def _cmd_login(provider: str):
-    if provider not in PROVIDERS:
-        raise ValueError(f"Unknown provider: {provider}")
-    await _reset_browser()
-    pw = await async_playwright().start()
-    browser = await pw.chromium.launch(headless=False)
-    context = await browser.new_context(
+async def _new_page():
+    """Create a fresh page with stealth context."""
+    await _ensure_chat_browser()
+    context = await _chat_bstate["browser"].new_context(
         viewport={"width": 1280, "height": 720},
         user_agent=USER_AGENT,
+        locale="en-US",
     )
+    await context.add_init_script(STEALTH_INIT_JS)
     page = await context.new_page()
-    await page.goto(PROVIDERS[provider]["url"])
-    _bstate.update(
-        {
-            "pw": pw,
-            "browser": browser,
-            "context": context,
-            "page": page,
-            "login_provider": provider,
-            "login_window_open": True,
-        }
-    )
+    return context, page
 
 
-async def _cmd_login_confirm(provider: str) -> dict:
-    if not _bstate["page"]:
-        return {"_client_error": "No browser open"}
-    if _bstate["login_provider"] != provider:
-        return {
-            "_client_error": f"Login browser is open for '{_bstate['login_provider']}', not '{provider}'"
-        }
+# ---------------------------------------------------------------------------
+# Response extractors per provider
+# ---------------------------------------------------------------------------
 
-    page = _bstate["page"]
-    context = _bstate["context"]
 
-    # NOTE: networkidle can hang forever on sites with persistent connections
-    # (Doubao keeps websocket/long-poll connections open), which previously made
-    # this route raise TimeoutError -> HTTP 500. Guard with a short timeout and
-    # fall back to domcontentloaded.
+async def _extract_google_response(page) -> str:
+    """Extract AI Overview or search result content from Google."""
     try:
-        await page.wait_for_load_state("domcontentloaded", timeout=5000)
+        await page.wait_for_load_state("domcontentloaded", timeout=15000)
     except Exception:
         pass
-    await asyncio.sleep(1)
+    await asyncio.sleep(3)
 
-    # Save cookies + localStorage
+    # Detect bot / CAPTCHA page early
     try:
-        cookies = await context.cookies()
-        local_storage = await page.evaluate("""() => {
-            const local = {};
-            for (let i = 0; i < localStorage.length; i++) {
-                const key = localStorage.key(i);
-                local[key] = localStorage.getItem(key);
-            }
-            return local;
-        }""")
-        save_storage(provider, cookies, local_storage)
-    except Exception as e:
-        print(f"Failed to save storage for {provider}: {e}")
-
-    # Check login success using provider-specific JS
-    login_check_js = PROVIDER_CONFIGS[provider].get("login_check_js", "() => true")
-    try:
-        is_logged_in: bool = await page.evaluate(login_check_js)
+        body_text = await page.evaluate("() => document.body.innerText || ''")
+        if "unusual traffic" in body_text or "captcha" in body_text.lower():
+            return (
+                "Google has detected automated traffic from this IP and is "
+                "showing a CAPTCHA. This provider may not work reliably from "
+                "server environments."
+            )
     except Exception:
-        is_logged_in = True  # assume logged in if check fails
+        pass
 
-    _bstate["login_window_open"] = False
+    # Try AI Overview selectors
+    selectors = [
+        "[data-attrid='wa:/description']",
+        "[class*='ai-overview']",
+        "[class*='AIO']",
+        "[data-sncf]",
+        ".IZ6rdc",
+        "[class*='kp-wholepage']",
+    ]
+    for sel in selectors:
+        try:
+            el = await page.query_selector(sel)
+            if el:
+                text = await el.inner_text()
+                text = text.strip()
+                if len(text) > 30:
+                    return text
+        except Exception:
+            continue
 
-    # A fresh session was just saved — drop any cached chat page so the next
-    # request rebuilds it with the new cookies/localStorage.
-    await _invalidate_chat_page(provider)
+    # Fallback: grab all visible text from main content
+    try:
+        body_text = await page.evaluate("""() => {
+            const main = document.querySelector('#main') || document.querySelector('#rso') || document.body;
+            return main.innerText || '';
+        }""")
+        lines = [line.strip() for line in body_text.split('\n') if len(line.strip()) > 20]
+        if lines:
+            return '\n\n'.join(lines[:30])
+    except Exception:
+        pass
 
-    # Close the visible browser
-    await _reset_browser()
+    return "No AI response extracted from Google. The page may have loaded differently."
 
-    name = PROVIDERS[provider]["name"]
-    return {
-        "success": True,
-        "logged_in": is_logged_in,
-        "provider": provider,
-        "message": f"{name} session saved! You can close the browser window.",
-    }
+
+async def _extract_duckduckgo_response(page, message: str) -> str:
+    """Navigate to DuckDuckGo AI, type the message, submit, and extract the response."""
+    try:
+        await page.wait_for_load_state("domcontentloaded", timeout=15000)
+    except Exception:
+        pass
+
+    # Wait for the chat input textarea to appear
+    textarea = None
+    for _ in range(40):
+        try:
+            textarea = await page.query_selector(
+                "textarea#searchbox_input, "
+                "textarea[placeholder*='Ask'], "
+                "textarea[placeholder*='ask'], "
+                "textarea[placeholder*='Type'], "
+                "textarea[placeholder*='Message'], "
+                "textarea"
+            )
+            if textarea and await textarea.is_visible():
+                break
+            textarea = None
+        except Exception:
+            pass
+        await asyncio.sleep(0.5)
+
+    if not textarea:
+        return "Could not find DuckDuckGo AI chat input."
+
+    # Type the message
+    try:
+        await textarea.click()
+        await textarea.fill(message)
+        await asyncio.sleep(0.5)
+    except Exception as e:
+        return f"Failed to type message: {e}"
+
+    # Find and click the submit / Ask button
+    submit_clicked = False
+    # Try clicking various submit buttons
+    submit_selectors = [
+        "button[aria-label='Ask']",
+        "button[aria-label='ask']",
+        "button[type='submit']",
+        "button.submit",
+        "form button",
+    ]
+    for sel in submit_selectors:
+        try:
+            btn = await page.query_selector(sel)
+            if btn and await btn.is_visible():
+                await btn.click()
+                submit_clicked = True
+                break
+        except Exception:
+            continue
+
+    if not submit_clicked:
+        # Fallback: press Enter
+        await page.keyboard.press("Enter")
+
+    # Wait for the response to appear — DDG streams the response token by token
+    # We poll the page, looking for new content that wasn't there before.
+    await asyncio.sleep(3)
+
+    # Snapshot baseline text
+    try:
+        baseline_text = await page.evaluate("() => document.body.innerText || ''")
+    except Exception:
+        baseline_text = ""
+
+    # Poll for new substantial content
+    response = ""
+    for attempt in range(60):
+        await asyncio.sleep(1.5)
+        try:
+            await page.evaluate("() => document.body.innerText || ''")
+        except Exception:
+            continue
+
+        # Look for new content that appeared after our baseline
+        # The AI response should be new text that wasn't in the baseline
+        new_text = ""
+        # Try to find the response container directly
+        response_selectors = [
+            "[class*='chat-msg']",
+            "[class*='message']",
+            "[class*='response']",
+            "[class*='answer']",
+            "[class*='result']",
+            "[class*='prose']",
+            "#chat-history",
+            "[class*='markdown']",
+        ]
+        for sel in response_selectors:
+            try:
+                elements = await page.query_selector_all(sel)
+                for el in elements:
+                    t = (await el.inner_text()).strip()
+                    # Must be new content (not in baseline) and substantial
+                    if len(t) > 10 and t not in baseline_text:
+                        if len(t) > len(new_text):
+                            new_text = t
+            except Exception:
+                continue
+
+        # Also check for any visible element with the user's query echoed
+        # followed by response text
+        if not new_text:
+            try:
+                full = await page.evaluate("""() => {
+                    const all = document.querySelectorAll('div, p, span, article, section');
+                    const texts = [];
+                    for (const el of all) {
+                        if (el.children.length === 0 || el.querySelector('p, div')) {
+                            const t = (el.innerText || '').trim();
+                            if (t.length > 20) texts.push(t);
+                        }
+                    }
+                    return texts.join('\\n---\\n');
+                }""")
+                # Find chunks not in baseline
+                chunks = full.split('\n---\n')
+                for chunk in chunks:
+                    chunk = chunk.strip()
+                    if len(chunk) > 30 and chunk not in baseline_text:
+                        if len(chunk) > len(new_text):
+                            new_text = chunk
+            except Exception:
+                pass
+
+        if new_text and len(new_text) > 20:
+            # Check if it seems stable (content stopped growing)
+            response = new_text
+            # Give it a few more seconds to check if more is streaming in
+            for _ in range(5):
+                await asyncio.sleep(1)
+                try:
+                    await page.evaluate("() => document.body.innerText || ''")
+                except Exception:
+                    continue
+                # Re-check for response in latest
+                latest_new = ""
+                for sel in response_selectors:
+                    try:
+                        elements = await page.query_selector_all(sel)
+                        for el in elements:
+                            t = (await el.inner_text()).strip()
+                            if len(t) > 10 and t not in baseline_text:
+                                if len(t) > len(latest_new):
+                                    latest_new = t
+                    except Exception:
+                        continue
+                if latest_new and len(latest_new) > len(response):
+                    response = latest_new
+                else:
+                    break
+            if response:
+                return response
+
+    if response:
+        return response
+    return "No AI response extracted from DuckDuckGo. The response may still be loading."
+
+
+async def _extract_perplexity_response(page) -> str:
+    """Extract answer from Perplexity search results."""
+    try:
+        await page.wait_for_load_state("domcontentloaded", timeout=15000)
+    except Exception:
+        pass
+    await asyncio.sleep(5)
+
+    # Detect Cloudflare challenge
+    try:
+        body_text = await page.evaluate("() => document.body.innerText || ''")
+        if "security verification" in body_text.lower() or "checking" in body_text.lower():
+            # Wait longer — Cloudflare challenge may auto-resolve
+            await asyncio.sleep(10)
+            body_text = await page.evaluate("() => document.body.innerText || ''")
+            if "security verification" in body_text.lower():
+                return (
+                    "Perplexity is showing a Cloudflare security verification page. "
+                    "This may resolve automatically if you wait, or it may indicate "
+                    "that the IP is being rate-limited."
+                )
+    except Exception:
+        pass
+
+    # Perplexity renders answer in various containers
+    selectors = [
+        ".prose",
+        "[class*='answer']",
+        "[class*='markdown']",
+        "[class*='prose']",
+        "#answer",
+        "[data-testid='answer']",
+    ]
+    for sel in selectors:
+        try:
+            el = await page.query_selector(sel)
+            if el:
+                text = await el.inner_text()
+                text = text.strip()
+                if len(text) > 30:
+                    return text
+        except Exception:
+            continue
+
+    # Fallback
+    try:
+        body = await page.evaluate("() => document.body.innerText || ''")
+        lines = [line.strip() for line in body.split('\n') if len(line.strip()) > 20]
+        if lines:
+            return '\n\n'.join(lines[:30])
+    except Exception:
+        pass
+
+    return "No AI response extracted from Perplexity."
 
 
 async def _cmd_chat(message: str, provider: str | None = None) -> dict:
-    """Send a message via the long-lived headless browser for *provider*.
-
-    Reuses a cached, already-logged-in page (perf), fills the input in one shot,
-    and detects completion via an injected MutationObserver instead of polling
-    the whole DOM every couple of seconds.
-    If provider is None, the round-robin selects the next ready one.
-    """
+    """Send a message to a free AI provider, navigate, and extract the response."""
     if provider is None:
         provider = _next_provider()
     if provider is None:
-        return {
-            "_client_error": "No providers are logged in. Please login to at least one."
-        }
-    if not provider_ready(provider):
-        return {"_client_error": f"{PROVIDERS[provider]['name']} is not logged in."}
+        return {"_client_error": "No providers available."}
+    if provider not in PROVIDERS:
+        return {"_client_error": f"Unknown provider: {provider}"}
 
-    _bstate["active_provider"] = provider
-    cfg = PROVIDER_CONFIGS[provider]
     prov = PROVIDERS[provider]
+    query = quote_plus(message)
+    url = prov["url"].format(query=query)
 
+    context, page = await _new_page()
     try:
-        page = await _get_chat_page(provider)
+        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        await asyncio.sleep(2)
 
-        input_field = await _find_chat_input(page, cfg)
-        if not input_field:
-            # Cached page may be stale; rebuild once and retry.
-            await _invalidate_chat_page(provider)
-            page = await _get_chat_page(provider)
-            input_field = await _find_chat_input(page, cfg)
-        if not input_field:
-            raise RuntimeError(
-                f"Could not find chat input on {prov['name']} — "
-                "session may have expired, please re-login."
-            )
-
-        # (B) Install the streaming observer BEFORE sending, capturing the
-        # current best-candidate text so we can tell when a *new* reply appears.
-        segment_sel_js = json.dumps(cfg["segment_selectors"])
-        noise_patterns_js = (
-            ", ".join(cfg["noise_patterns"]) if cfg["noise_patterns"] else ""
-        )
-        generating_sel = json.dumps(cfg["generating_sel"])
-
-        observer_js = f"""(userMsg) => {{
-            const segmentSelectors = {segment_sel_js};
-            const noisePatterns = [{noise_patterns_js}];
-            function isNoise(t) {{ return noisePatterns.some(p => p.test(t.trim())); }}
-            function candidates() {{
-                let out = [];
-                for (const sel of segmentSelectors) {{
-                    document.querySelectorAll(sel).forEach(el => {{
-                        const t = (el.innerText || '').trim();
-                        // drop noise and the echoed user prompt itself
-                        if (t.length > 10 && !isNoise(t) && t !== userMsg) out.push(t);
-                    }});
-                }}
-                if (out.length === 0) {{
-                    document.querySelectorAll('[class*="markdown"], [class*="prose"]').forEach(el => {{
-                        const t = (el.innerText || '').trim();
-                        if (t.length > 10 && !isNoise(t) && t !== userMsg) out.push(t);
-                    }});
-                }}
-                return out;
-            }}
-            // Snapshot text that already exists before sending (welcome blurbs,
-            // prior turns) so we only surface a NEW reply.
-            const baseline = new Set(candidates());
-            const st = {{ text: '', changed: Date.now() }};
-            window.__chatState = st;
-            window.__chatPick = () => {{
-                const cs = candidates();
-                for (let i = cs.length - 1; i >= 0; i--) {{
-                    if (!baseline.has(cs[i])) return cs[i];
-                }}
-                return '';
-            }};
-            if (window.__chatObserver) window.__chatObserver.disconnect();
-            const update = () => {{
-                const pick = window.__chatPick();
-                if (pick && pick !== st.text) {{ st.text = pick; st.changed = Date.now(); }}
-            }};
-            const obs = new MutationObserver(update);
-            obs.observe(document.body, {{ childList: true, subtree: true, characterData: true }});
-            window.__chatObserver = obs;
-            return baseline.size;
-        }}"""
-        await page.evaluate(observer_js, message)
-
-        # Send the message.
-        await _fill_input(page, input_field, message)
-        await page.keyboard.press("Enter")
-
-        # (B) Read state at a short interval (also re-pick here in case the
-        # observer missed a mutation) and finish when the reply text is stable.
-        read_state_js = f"""() => {{
-            const st = window.__chatState || {{ text: '', changed: 0 }};
-            if (window.__chatPick) {{
-                const pick = window.__chatPick();
-                if (pick && pick !== st.text) {{ st.text = pick; st.changed = Date.now(); }}
-            }}
-            const generating = document.querySelectorAll({generating_sel}).length > 0;
-            return {{ text: st.text, idleMs: Date.now() - st.changed, generating }};
-        }}"""
-
-        response = ""
-        # Finish when the reply text has been stable (no growth) long enough.
-        # If a generating indicator is still present we require a longer quiet
-        # window; otherwise a short one. This stays robust even when a
-        # provider's "generating" selector matches some always-present element.
-        quiet_idle_ms = 900  # stable window when generation looks done
-        quiet_busy_ms = 2500  # stable window while still "generating"
-        start = time.time()
-        got_first = False
-        while time.time() - start < 90:
-            try:
-                state = await page.evaluate(read_state_js)
-            except Exception as exc:
-                print(f"Read error ({provider}): {exc}")
-                await asyncio.sleep(0.5)
-                continue
-            text = state.get("text", "")
-            idle_ms = state.get("idleMs", 0)
-            generating = state.get("generating", False)
-            if text and len(text) > 10:
-                got_first = True
-                threshold = quiet_busy_ms if generating else quiet_idle_ms
-                if idle_ms >= threshold:
-                    response = text
-                    break
-            # Poll fast while streaming; back off slightly before first token.
-            await asyncio.sleep(0.3 if got_first else 0.5)
-
-        # Persist refreshed session (cookies can rotate); keep the page open.
-        try:
-            cached = _chat_bstate["pages"].get(provider)
-            if cached:
-                updated_cookies = await cached["context"].cookies()
-                updated_local: dict = await page.evaluate("""() => {
-                    const local = {};
-                    for (let i = 0; i < localStorage.length; i++) {
-                        const key = localStorage.key(i);
-                        local[key] = localStorage.getItem(key);
-                    }
-                    return local;
-                }""")
-                save_storage(provider, updated_cookies, updated_local)
-        except Exception as e:
-            print(f"Failed to update storage for {provider}: {e}")
-
+        if provider == "google":
+            response = await _extract_google_response(page)
+        elif provider == "duckduckgo":
+            response = await _extract_duckduckgo_response(page, message)
+        elif provider == "perplexity":
+            response = await _extract_perplexity_response(page)
+        else:
+            response = f"Provider {provider} not implemented."
     finally:
-        _bstate["active_provider"] = None
+        try:
+            await context.close()
+        except Exception:
+            pass
 
     if response:
         return {"success": True, "response": response, "provider": provider}
-    raise RuntimeError(
-        f"No response from {prov['name']}. Session may have expired — please re-login."
-    )
-
-
-async def _fill_input(page, input_field, message: str):
-    """Set the chat input value reliably, including CJK text.
-
-    Playwright's ``fill`` uses insertText and works for both textareas and
-    contenteditable editors, and unlike per-key ``type`` it inputs CJK
-    characters correctly in headless Chromium (``type`` can turn them into
-    "?"). We fall back to ``insert_text`` then ``type`` only if fill fails.
-    """
-    try:
-        await input_field.click()
-    except Exception:
-        pass
-    try:
-        await input_field.fill("")
-        await input_field.fill(message)
-        return
-    except Exception:
-        pass
-    # Fallbacks for editors that reject fill().
-    try:
-        await input_field.evaluate("el => el.focus()")
-        await page.keyboard.insert_text(message)
-        return
-    except Exception:
-        pass
-    await page.keyboard.type(message)
+    return {"_client_error": f"No response from {prov['name']}."}
 
 
 async def _cmd_close():
-    await _reset_browser()
     await _close_chat_browser()
-
-
-def _cmd_providers() -> dict:
-    """Return status of all providers (sync — no Playwright I/O)."""
-    active = _bstate.get("active_provider")
-    login_provider = _bstate.get("login_provider")
-    login_open = _bstate.get("login_window_open", False)
-    result = {}
-    for key, prov in PROVIDERS.items():
-        result[key] = {
-            "name": prov["name"],
-            "color": prov["color"],
-            "icon": prov["icon"],
-            "ready": provider_ready(key),
-            "active": key == active,
-            "login_open": login_open and login_provider == key,
-        }
-    return result
 
 
 # ---------------------------------------------------------------------------
@@ -814,7 +588,6 @@ def index():
             "name": v["name"],
             "color": v["color"],
             "icon": v["icon"],
-            "ready": provider_ready(k),
         }
         for k, v in PROVIDERS.items()
     }
@@ -823,60 +596,32 @@ def index():
 
 @app.route("/api/providers")
 def api_providers():
-    try:
-        data, _ = _send("providers")
-        return jsonify(data)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    return jsonify(
+        {
+            k: {
+                "name": v["name"],
+                "color": v["color"],
+                "icon": v["icon"],
+                "ready": True,
+                "active": False,
+            }
+            for k, v in PROVIDERS.items()
+        }
+    )
 
 
 @app.route("/api/status")
 def api_status():
-    try:
-        data, _ = _send("providers")
-        rp = [k for k, v in data.items() if v["ready"]]
-        return jsonify(
-            {
-                "providers": data,
-                "any_ready": len(rp) > 0,
-                "ready_providers": rp,
-            }
-        )
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/api/login/<provider>", methods=["POST"])
-def api_login(provider: str):
-    if provider not in PROVIDERS:
-        return jsonify({"error": f"Unknown provider: {provider}"}), 400
-    try:
-        data, _ = _send("login", provider=provider)
-        return jsonify(data)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/api/login/<provider>/confirm", methods=["POST"])
-def api_login_confirm(provider: str):
-    if provider not in PROVIDERS:
-        return jsonify({"error": f"Unknown provider: {provider}"}), 400
-    try:
-        data, status = _send("login_confirm", provider=provider)
-        return jsonify(data), (status or 200)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-# Backwards-compatible aliases for Kimi
-@app.route("/api/login", methods=["POST"])
-def api_login_kimi():
-    return api_login("kimi")
-
-
-@app.route("/api/login/confirm", methods=["POST"])
-def api_login_confirm_kimi():
-    return api_login_confirm("kimi")
+    return jsonify(
+        {
+            "providers": {
+                k: {"name": v["name"], "ready": True}
+                for k, v in PROVIDERS.items()
+            },
+            "any_ready": True,
+            "ready_providers": list(PROVIDERS.keys()),
+        }
+    )
 
 
 @app.route("/api/chat", methods=["POST"])
@@ -885,7 +630,7 @@ def api_chat():
     message = body.get("message", "").strip()
     if not message:
         return jsonify({"error": "No message provided"}), 400
-    provider = body.get("provider") or None  # optional: pin to a specific provider
+    provider = body.get("provider") or None
     try:
         data, status = _send("chat", message=message, provider=provider)
         return jsonify(data), (status or 200)
@@ -907,6 +652,7 @@ def api_close():
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    print("Starting AI Chat Router...")
+    print("Starting AI Chat Router (Free Providers)...")
+    print("Providers: Google AI, DuckDuckGo AI, Perplexity")
     print("Open http://localhost:5000 in your browser")
     app.run(debug=False, host="0.0.0.0", port=5000, threaded=True)

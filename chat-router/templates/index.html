@@ -17,7 +17,7 @@
         <aside class="sidebar">
             <div class="sidebar-header">
                 <h1>AI Router</h1>
-                <p class="sidebar-sub">Round-robin chat proxy</p>
+                <p class="sidebar-sub">Free providers &mdash; no login</p>
             </div>
 
             <div class="provider-list" id="provider-list">
@@ -33,8 +33,8 @@
         <main class="chat-panel">
             <div class="chat-messages" id="chat-messages">
                 <div class="msg msg--system">
-                    Welcome! Login to at least one provider on the left, then start chatting.
-                    Messages are forwarded round-robin across all logged-in providers.
+                    Welcome! Select a provider or let the round-robin pick one.
+                    Messages are forwarded to Google AI, DuckDuckGo AI, or Perplexity.
                 </div>
             </div>
 
@@ -44,50 +44,16 @@
                     placeholder="Type your message… (Enter to send, Shift+Enter for newline)"
                     rows="3"
                 ></textarea>
-                <button id="btn-send" class="btn btn-primary" disabled>Send</button>
+                <button id="btn-send" class="btn btn-primary">Send</button>
             </div>
         </main>
-    </div>
-
-    <!-- ── Login modal ───────────────────────────────────────────── -->
-    <div class="modal-overlay" id="modal-overlay" style="display:none">
-        <div class="modal">
-            <h2 id="modal-title">Login</h2>
-            <div class="modal-steps">
-                <div class="modal-step">
-                    <span class="step-num">1</span>
-                    <div>
-                        <strong>Open browser</strong>
-                        <p id="modal-desc">A browser window will open. Login to your account.</p>
-                        <button id="modal-btn-open" class="btn btn-primary">Open Login Window</button>
-                    </div>
-                </div>
-                <div class="modal-step">
-                    <span class="step-num">2</span>
-                    <div>
-                        <strong>Login manually</strong>
-                        <p>Complete the login in the browser window.</p>
-                    </div>
-                </div>
-                <div class="modal-step">
-                    <span class="step-num">3</span>
-                    <div>
-                        <strong>Confirm</strong>
-                        <p>Click below once you are logged in.</p>
-                        <button id="modal-btn-confirm" class="btn btn-success" disabled>I've logged in</button>
-                    </div>
-                </div>
-            </div>
-            <button class="modal-close" id="modal-btn-close">Cancel</button>
-        </div>
     </div>
 
     <script>
     (() => {
         // ── State ───────────────────────────────────────────────────
-        let providers = {};          // keyed by provider id
-        let activeModal = null;      // provider id whose modal is open
-        let pollTimer = null;
+        let providers = {};
+        let activeProvider = null;  // pin to a specific provider, or null for round-robin
 
         // ── DOM refs ────────────────────────────────────────────────
         const providerList  = document.getElementById('provider-list');
@@ -95,12 +61,6 @@
         const messageInput  = document.getElementById('message-input');
         const btnSend       = document.getElementById('btn-send');
         const rrStatus      = document.getElementById('rr-status');
-        const modalOverlay  = document.getElementById('modal-overlay');
-        const modalTitle    = document.getElementById('modal-title');
-        const modalDesc     = document.getElementById('modal-desc');
-        const modalBtnOpen  = document.getElementById('modal-btn-open');
-        const modalBtnConfirm = document.getElementById('modal-btn-confirm');
-        const modalBtnClose = document.getElementById('modal-btn-close');
 
         // ── Provider polling ────────────────────────────────────────
         async function fetchProviders() {
@@ -108,7 +68,6 @@
                 const res = await fetch('/api/providers');
                 providers = await res.json();
                 renderProviders();
-                updateSendButton();
             } catch (e) {
                 console.error('fetchProviders:', e);
             }
@@ -116,39 +75,26 @@
 
         function startPolling() {
             fetchProviders();
-            pollTimer = setInterval(fetchProviders, 5000);
+            setInterval(fetchProviders, 10000);
         }
 
         // ── Render sidebar ──────────────────────────────────────────
         function renderProviders() {
             providerList.innerHTML = '';
-            const anyReady = Object.values(providers).some(p => p.ready);
-
-            // Round-robin status label
-            const readyNames = Object.entries(providers)
-                .filter(([, p]) => p.ready)
-                .map(([, p]) => p.name);
-            if (readyNames.length === 0) {
-                rrStatus.textContent = 'No providers ready';
-                rrStatus.className = 'rr-status rr-status--none';
-            } else {
-                rrStatus.textContent = 'Round-robin: ' + readyNames.join(' → ');
-                rrStatus.className = 'rr-status rr-status--active';
-            }
+            const names = Object.values(providers).map(p => p.name);
+            rrStatus.textContent = 'Round-robin: ' + names.join(' → ');
+            rrStatus.className = 'rr-status rr-status--active';
 
             for (const [id, p] of Object.entries(providers)) {
                 const card = document.createElement('div');
-                card.className = 'provider-card' +
-                    (p.active     ? ' provider-card--active'     : '') +
-                    (p.login_open ? ' provider-card--login-open' : '') +
-                    (p.ready      ? ' provider-card--ready'      : '');
+                card.className = 'provider-card provider-card--ready' +
+                    (activeProvider === id ? ' provider-card--active' : '');
                 card.dataset.provider = id;
+                card.style.cursor = 'pointer';
 
                 const dot = document.createElement('span');
                 dot.className = 'provider-dot' +
-                    (p.active     ? ' dot--active' :
-                     p.login_open ? ' dot--pending' :
-                     p.ready      ? ' dot--ready'   : ' dot--off');
+                    (activeProvider === id ? ' dot--active' : ' dot--ready');
 
                 const icon = document.createElement('span');
                 icon.className = 'provider-icon';
@@ -164,25 +110,26 @@
 
                 const statusLabel = document.createElement('span');
                 statusLabel.className = 'provider-status-label';
-                statusLabel.textContent =
-                    p.active     ? 'Responding...' :
-                    p.login_open ? 'Waiting for login...' :
-                    p.ready      ? 'Ready' : 'Not logged in';
+                statusLabel.textContent = activeProvider === id ? 'Selected' : 'Ready';
 
                 info.appendChild(name);
                 info.appendChild(statusLabel);
 
                 const btn = document.createElement('button');
-                btn.className = 'btn btn-sm ' + (p.ready ? 'btn-outline' : 'btn-primary');
-                btn.textContent = p.login_open ? "Confirm login" :
-                                  p.ready      ? 'Re-login'      : 'Login';
+                btn.className = 'btn btn-sm ' +
+                    (activeProvider === id ? 'btn-primary' : 'btn-outline');
+                btn.textContent = activeProvider === id ? 'Using' : 'Select';
                 btn.dataset.provider = id;
 
-                if (p.login_open) {
-                    btn.addEventListener('click', () => openConfirmModal(id));
-                } else {
-                    btn.addEventListener('click', () => openLoginModal(id));
-                }
+                btn.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    if (activeProvider === id) {
+                        activeProvider = null;  // deselect → back to round-robin
+                    } else {
+                        activeProvider = id;
+                    }
+                    renderProviders();
+                });
 
                 card.appendChild(dot);
                 card.appendChild(icon);
@@ -191,106 +138,6 @@
                 providerList.appendChild(card);
             }
         }
-
-        function updateSendButton() {
-            const anyReady = Object.values(providers).some(p => p.ready);
-            btnSend.disabled = !anyReady;
-        }
-
-        // ── Highlight active provider card ──────────────────────────
-        function setActiveCard(providerId) {
-            document.querySelectorAll('.provider-card').forEach(c => {
-                c.classList.toggle('provider-card--active', c.dataset.provider === providerId);
-            });
-        }
-
-        function clearActiveCard() {
-            document.querySelectorAll('.provider-card').forEach(c => {
-                c.classList.remove('provider-card--active');
-            });
-        }
-
-        // ── Login modal ─────────────────────────────────────────────
-        function openLoginModal(providerId) {
-            activeModal = providerId;
-            const p = providers[providerId];
-            modalTitle.textContent = `Login to ${p.name}`;
-            modalDesc.textContent  = `A browser window will open for ${p.name}. Login to your account, then click "I've logged in".`;
-            modalBtnOpen.textContent = `Open ${p.name} Login`;
-            modalBtnConfirm.disabled = true;
-            modalBtnConfirm.textContent = "I've logged in";
-            modalOverlay.style.display = 'flex';
-        }
-
-        function openConfirmModal(providerId) {
-            activeModal = providerId;
-            const p = providers[providerId];
-            modalTitle.textContent = `Confirm ${p.name} Login`;
-            modalDesc.textContent = 'Browser window is already open. Click below once you are logged in.';
-            modalBtnOpen.textContent = `Re-open ${p.name} Login`;
-            modalBtnConfirm.disabled = false;
-            modalOverlay.style.display = 'flex';
-        }
-
-        function closeModal() {
-            activeModal = null;
-            modalOverlay.style.display = 'none';
-            modalBtnConfirm.disabled = true;
-        }
-
-        modalBtnClose.addEventListener('click', closeModal);
-        modalOverlay.addEventListener('click', e => { if (e.target === modalOverlay) closeModal(); });
-
-        modalBtnOpen.addEventListener('click', async () => {
-            if (!activeModal) return;
-            modalBtnOpen.disabled = true;
-            modalBtnOpen.textContent = 'Opening...';
-            try {
-                const res = await fetch(`/api/login/${activeModal}`, { method: 'POST' });
-                const data = await res.json();
-                if (data.success) {
-                    modalBtnConfirm.disabled = false;
-                    addSystemMsg(`${providers[activeModal].name} login window opened. Login then click "I've logged in".`);
-                    await fetchProviders();
-                } else {
-                    addErrorMsg('Error opening login: ' + (data.error || 'Unknown error'));
-                }
-            } catch (e) {
-                addErrorMsg('Network error: ' + e.message);
-            }
-            modalBtnOpen.disabled = false;
-            modalBtnOpen.textContent = `Open ${providers[activeModal]?.name || ''} Login`;
-        });
-
-        modalBtnConfirm.addEventListener('click', async () => {
-            if (!activeModal) return;
-            const pid = activeModal;
-            modalBtnConfirm.disabled = true;
-            modalBtnConfirm.textContent = 'Saving...';
-            try {
-                const res = await fetch(`/api/login/${pid}/confirm`, { method: 'POST' });
-                const data = await res.json();
-                if (data.success) {
-                    if (data.logged_in) {
-                        addSystemMsg(`${providers[pid].name} login saved! Ready to chat.`);
-                        closeModal();
-                        await fetchProviders();
-                    } else {
-                        addErrorMsg(`${providers[pid].name}: Login not detected. Please make sure you are fully logged in.`);
-                        modalBtnConfirm.disabled = false;
-                        modalBtnConfirm.textContent = "I've logged in";
-                    }
-                } else {
-                    addErrorMsg('Error confirming login: ' + (data.error || 'Unknown error'));
-                    modalBtnConfirm.disabled = false;
-                    modalBtnConfirm.textContent = "I've logged in";
-                }
-            } catch (e) {
-                addErrorMsg('Network error: ' + e.message);
-                modalBtnConfirm.disabled = false;
-                modalBtnConfirm.textContent = "I've logged in";
-            }
-        });
 
         // ── Chat ────────────────────────────────────────────────────
         btnSend.addEventListener('click', sendMessage);
@@ -306,24 +153,22 @@
             btnSend.disabled = true;
             btnSend.textContent = 'Sending...';
 
-            // Add a loading bubble
             const loadingId = addLoadingMsg();
 
             try {
                 const res = await fetch('/api/chat', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ message: msg }),
+                    body: JSON.stringify({
+                        message: msg,
+                        provider: activeProvider,
+                    }),
                 });
                 const data = await res.json();
                 removeLoadingMsg(loadingId);
 
                 if (data.success) {
                     addAssistantMsg(data.response, data.provider);
-                    // Briefly highlight the provider card that responded
-                    setActiveCard(data.provider);
-                    setTimeout(clearActiveCard, 2000);
-                    await fetchProviders();
                 } else {
                     addErrorMsg('Error: ' + (data.error || 'Unknown error'));
                 }
@@ -334,7 +179,6 @@
 
             btnSend.disabled = false;
             btnSend.textContent = 'Send';
-            updateSendButton();
         }
 
         // ── Message helpers ─────────────────────────────────────────
@@ -359,7 +203,6 @@
             const body = document.createElement('div');
             body.className = 'msg-md';
             body.innerHTML = renderMarkdown(text);
-            // Syntax-highlight any code blocks.
             if (window.hljs) {
                 body.querySelectorAll('pre code').forEach((el) => {
                     try { window.hljs.highlightElement(el); } catch (e) {}
@@ -383,8 +226,6 @@
             chatMessages.scrollTop = chatMessages.scrollHeight;
         }
 
-        // Render markdown to sanitized HTML. Falls back to escaped plain text
-        // (with newlines preserved) if the markdown libraries failed to load.
         function renderMarkdown(text) {
             text = text || '';
             if (window.marked && window.DOMPurify) {
